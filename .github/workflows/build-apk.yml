@@ -7,6 +7,7 @@ on:
       - 'Taxi_Profit_AI_v0.17_source.zip'
       - '.github/workflows/build-apk.yml'
       - 'branding/**'
+      - 'patches/**'
       - 'app/**'
       - 'build.gradle.kts'
       - 'settings.gradle.kts'
@@ -29,6 +30,10 @@ jobs:
             echo 'Android source archive missing'
             exit 1
           fi
+      - name: Apply compact main screen
+        run: |
+          cd android-project
+          python3 ../patches/simplify_main_v19.py
       - name: Apply approved launcher icon
         shell: bash
         run: |
@@ -45,7 +50,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 18').replace('0.17.0-approved-overlays', '0.18.0-branded'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 19').replace('0.17.0-approved-overlays', '0.19.0-compact-menu'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -76,13 +81,13 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='18'" apk-badging.txt
+          grep -q "versionCode='19'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
-          cp "$APK" TaxiProfitAI-v18.apk
+          cp "$APK" TaxiProfitAI-v19.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: TaxiProfitAI-v18-branded-apk
-          path: TaxiProfitAI-v18.apk
+          name: TaxiProfitAI-v19-branded-apk
+          path: TaxiProfitAI-v19.apk
           retention-days: 7
           if-no-files-found: error
