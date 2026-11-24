@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'Taxi_Profit_AI_v0.17_source.zip'
+      - '.github/workflows/build-apk.yml'
       - 'app/**'
       - 'build.gradle.kts'
       - 'settings.gradle.kts'
@@ -31,8 +32,20 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'platform-tools'
+      - name: Use runner Android SDK
+        shell: bash
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          MANAGER=$(find "$SDK/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)
+          test -x "$MANAGER"
+          if [ ! -f "$SDK/platforms/android-35/android.jar" ] || [ ! -x "$SDK/build-tools/35.0.0/aapt2" ]; then
+            "$MANAGER" --install 'platforms;android-35' 'build-tools;35.0.0' 'platform-tools'
+          fi
+          test -f "$SDK/platforms/android-35/android.jar"
+          test -x "$SDK/build-tools/35.0.0/aapt2"
+          echo "Android SDK ready at $SDK"
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
