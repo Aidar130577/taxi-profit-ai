@@ -97,6 +97,7 @@ jobs:
           cd android-project
           python3 ../patches/window_ocr_v21.py
           python3 ../patches/purple_demand_v22.py
+          python3 ../patches/accept_bar_v23.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -118,7 +119,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 22').replace('0.17.0-approved-overlays', '0.22.0-purple-demand'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 23').replace('0.17.0-approved-overlays', '0.23.0-accept-bar'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -155,16 +156,16 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='22'" apk-badging.txt
+          grep -q "versionCode='23'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
-          cp "$APK" TaxiProfitAI-v22.apk
+          cp "$APK" TaxiProfitAI-v23.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: TaxiProfitAI-v22-branded-apk
-          path: TaxiProfitAI-v22.apk
+          name: TaxiProfitAI-v23-branded-apk
+          path: TaxiProfitAI-v23.apk
           retention-days: 7
           if-no-files-found: error
