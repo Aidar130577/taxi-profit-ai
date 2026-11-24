@@ -91,6 +91,16 @@ jobs:
           assert 'title("Скидка' not in s
           p.write_text(s)
           PY
+      - name: Add local OCR and language models
+        shell: bash
+        run: |
+          cd android-project
+          python3 ../patches/window_ocr_v21.py
+          mkdir -p app/src/main/assets/tessdata
+          for lang in rus kaz eng; do
+            curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
+            test "$(wc -c < "app/src/main/assets/tessdata/$lang.traineddata")" -gt 100000
+          done
       - name: Apply approved launcher icon
         shell: bash
         run: |
@@ -107,7 +117,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 20').replace('0.17.0-approved-overlays', '0.20.0-minimal-menu'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 21').replace('0.17.0-approved-overlays', '0.21.0-local-ocr'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -138,13 +148,16 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='20'" apk-badging.txt
+          grep -q "versionCode='21'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
-          cp "$APK" TaxiProfitAI-v20.apk
+          unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
+          unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
+          cp "$APK" TaxiProfitAI-v21.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: TaxiProfitAI-v20-branded-apk
-          path: TaxiProfitAI-v20.apk
+          name: TaxiProfitAI-v21-branded-apk
+          path: TaxiProfitAI-v21.apk
           retention-days: 7
           if-no-files-found: error
