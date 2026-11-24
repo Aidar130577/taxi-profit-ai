@@ -34,6 +34,63 @@ jobs:
         run: |
           cd android-project
           python3 ../patches/simplify_main_v19.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("app/src/main/java/kz/taxiprofitai/MainActivity.kt")
+          s=p.read_text()
+          a=s.index('        more=action(')
+          b=s.index('        root.addView(action("OK',a)
+          s=s[:a]+s[b:]
+          a=s.index('        stop=action(')
+          b=s.index('        scroll.addView(root)',a)
+          s=s[:a]+s[b:]
+          s=s.replace('        stop.visibility=if(prefs.getBoolean("shift_active",false))View.VISIBLE else View.GONE','')
+          s=s.replace('Выбери свои тарифы','Мои тарифы')
+          a=s.index('    private fun save(): Boolean {')
+          b=s.index('    private fun showTest()',a)
+          s=s[:a]+'''    private fun save(): Boolean {
+                  val p=park.text.toString().trim().replace(',','.').toDoubleOrNull()
+                  val rates=checks.keys.mapNotNull { CommissionSettings.percent(prefs,it) }
+                  if(p==null || !p.isFinite() || p !in 0.0..100.0 || rates.any{it+p>100.0}){
+                      Toast.makeText(this,"Проверьте комиссию таксопарка",Toast.LENGTH_LONG).show()
+                      return false
+                  }
+                  prefs.edit().apply {
+                      checks.forEach{(name,c)->putBoolean("tariff_$name",c.isChecked)}
+                      putBoolean("airport",airport.isChecked)
+                      putString("park",p.toString())
+                      putInt("loyalty_discount",0)
+                  }.apply()
+                  return true
+              }
+          '''+s[b:]
+          a=s.index('                    prefs.edit().putBoolean("shift_active",true).apply()')
+          b=s.index('                    moveTaskToBack(true)',a)+len('                    moveTaskToBack(true)')
+          s=s[:a]+'                    startRadar()'+s[b:]
+          at=s.index('    private fun openPermissions()')
+          s=s[:at]+'''    private fun startRadar(){
+                  fun start(){
+                      prefs.edit().putBoolean("shift_active",true).apply()
+                      moveTaskToBack(true)
+                  }
+                  val installed=try{
+                      packageManager.getPackageInfo("btools.routingapp",0)
+                      true
+                  }catch(e:android.content.pm.PackageManager.NameNotFoundException){false}
+                  if(installed){start();return}
+                  android.app.AlertDialog.Builder(this)
+                      .setTitle("Расчёт маршрута")
+                      .setMessage("Для расчёта стоимости поездки этой тестовой версии нужен BRouter с картой Алматы. Без него можно проверить радар, но прогноз цены недоступен.")
+                      .setNegativeButton("Только радар"){_,_->start()}
+                      .setPositiveButton("Установить BRouter"){_,_->
+                          startActivity(Intent(Intent.ACTION_VIEW,android.net.Uri.parse("https://f-droid.org/packages/btools.routingapp/")))
+                      }.show()
+              }
+          '''+s[at:]
+          assert 'Дополнительные настройки' not in s
+          assert 'title("Скидка' not in s
+          p.write_text(s)
+          PY
       - name: Apply approved launcher icon
         shell: bash
         run: |
@@ -50,7 +107,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 19').replace('0.17.0-approved-overlays', '0.19.0-compact-menu'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 20').replace('0.17.0-approved-overlays', '0.20.0-minimal-menu'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -81,13 +138,13 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='19'" apk-badging.txt
+          grep -q "versionCode='20'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
-          cp "$APK" TaxiProfitAI-v19.apk
+          cp "$APK" TaxiProfitAI-v20.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: TaxiProfitAI-v19-branded-apk
-          path: TaxiProfitAI-v19.apk
+          name: TaxiProfitAI-v20-branded-apk
+          path: TaxiProfitAI-v20.apk
           retention-days: 7
           if-no-files-found: error
