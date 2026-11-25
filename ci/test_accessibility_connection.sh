@@ -57,7 +57,8 @@ public final class FixtureActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         TextView screen = new TextView(this);
-        screen.setText("Calculator test fixture");
+        screen.setText("Пропустить\nБ 12 км 1 ч 20 мин\n500 м · 4 мин\nБлижняя подача\nКомфорт+\n"
+            + "А: улица Тестовая, 135\nБ: Центральная улица, 8\nПассажир\nПринять ×1.00");
         setContentView(screen);
     }
 }
@@ -99,6 +100,10 @@ launch_driver_fixture
 adb logcat -c
 enable_service
 wait_for_log "Order overlay attached"
+wait_for_log "First offer quote drawn"
+latency=$(adb logcat -d -s "$log_tag:V" | sed -n 's/.*First offer quote drawn in \([0-9][0-9]*\)ms.*/\1/p' | head -n1)
+test "$latency" -le 4000
+echo "Native test order rendered in ${latency}ms from first detection on Android API $api"
 
 adb shell settings put secure accessibility_enabled 0
 adb shell settings delete secure enabled_accessibility_services

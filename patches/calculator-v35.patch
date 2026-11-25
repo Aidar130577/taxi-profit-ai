@@ -1,0 +1,350 @@
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
+@@ -16,6 +16,8 @@
+     private var footer="Нажмите, чтобы свернуть"
+     private val density=resources.displayMetrics.density
+     private var waiting = true
++    private var hasQuote = false
++    var onPriceDrawn: (() -> Unit)? = null
+     private var pickup: String? = null
+     private var destination: String? = null
+     private var pickupExtra: Long? = null
+@@ -83,6 +85,7 @@
+         }
+         text(c,footer,120f,footerY,14f,Color.WHITE,false,Paint.Align.CENTER,228f)
+         c.restore()
++        if (hasQuote) onPriceDrawn?.invoke()
+     }
+     fun showQuote(tariff:String,demand:String,estimate:LiveFareEstimate?,status:String,ratesExpired:Boolean,
+                   parkPct:Double, pickupAddress:String?, destinationAddress:String?, paidPickup: Long?){
+@@ -91,6 +94,7 @@
+         destination = destinationAddress
+         pickupExtra = paidPickup
+         waiting = false
++        hasQuote = estimate != null
+         if (logicalHeight != oldHeight) requestLayout()
+         title=when(tariff){"BS"->"Business BS";"EK"->"Economy EK";"K"->"Comfort K";"K+"->"Comfort K+";"EV"->"Electric EV";"PR"->"Premier PR";else->tariff}
+         demandText=demand
+@@ -102,7 +106,7 @@
+             status.startsWith("Нет маршрута") -> "Нет маршрута BRouter"
+             status.startsWith("Маршрут") -> "Считаем…"
+             status == "Учтён опыт поездок" || status == "Время скорректировано" -> status
+-            status == "База комиссии неизвестна" || status == "Время Яндекс Про" || status == "Цена Яндекс Про" -> status
++            status == "База комиссии неизвестна" || status == "За 4 сек цена не готова" || status == "Время Яндекс Про" || status == "Цена Яндекс Про" -> status
+             ratesExpired && estimate != null && !estimate.fromOrder -> "Исторические ставки"
+             else -> "Нажмите, чтобы свернуть"
+         }
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -34,6 +34,12 @@
+ 
+     private lateinit var windows: WindowManager
+     private var ocr: WindowOcr?=null
++    private var progressOcr: WindowOcr?=null
++    private var progressOcrBusy = false
++    private var lastProgressOcr = 0L
++    private var offerStartedAt: Long? = null
++    private var priceDrawn = false
++    private val offerDeadline = Runnable { render() }
+     private var scanGeneration=0L
+     private data class OcrOrder(val windowId: Int, val visible: String, val order: OrderTextParser.Detected)
+     private var currentNativeOffer: OrderTextParser.Detected? = null
+@@ -137,6 +143,10 @@
+         scanGeneration++
+         ocr?.close()
+         ocr = null
++        progressOcr?.close()
++        progressOcr = null
++        progressOcrBusy = false
++        lastProgressOcr = 0L
+         ocrBusy = false
+         closeOffer()
+         hideFarePopup()
+@@ -146,7 +156,17 @@
+ 
+     private fun showFarePopup() {
+         if (popup != null) return
+-        val panel = OfferPopupView(this)
++        val panel = OfferPopupView(this).apply {
++            onPriceDrawn = {
++                val started = offerStartedAt
++                if (started != null && !priceDrawn) {
++                    priceDrawn = true
++                    ui.removeCallbacks(offerDeadline)
++                    val latency = android.os.SystemClock.elapsedRealtime() - started
++                    Log.i("ZnayTsenuService", "First offer quote drawn in ${latency}ms")
++                }
++            }
++        }
+         val layout = WindowManager.LayoutParams(
+             minOf(dp(240), screenWidth()), WindowManager.LayoutParams.WRAP_CONTENT,
+             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+@@ -238,6 +258,10 @@
+         currentNativeOffer = null
+         loggedOffer = false
+         loggedIdentity = null
++        lastOcr = 0L
++        offerStartedAt = null
++        priceDrawn = false
++        ui.removeCallbacks(offerDeadline)
+         offerPopupState.clear()
+     }
+ 
+@@ -252,7 +276,7 @@
+             scanSafely(retryIfMissing = true)
+         } else {
+             val elapsed = android.os.SystemClock.elapsedRealtime() - lastScan
+-            scheduleScan((450L - elapsed).coerceAtLeast(0L))
++            scheduleScan((180L - elapsed).coerceAtLeast(0L))
+         }
+     }
+ 
+@@ -356,84 +380,97 @@
+         original:OrderTextParser.Detected, badgeOnly:Boolean, progressOnly:Boolean = false
+     ){
+         if(android.os.Build.VERSION.SDK_INT<34 || !prefs.getBoolean("ocr_allowed",false))return
+-        if(ocrBusy || now-lastOcr<1800L)return
+-        val worker = ocr ?: WindowOcr(this).also { ocr = it }
+-        ocrBusy=true;lastOcr=now
++        val worker = if (progressOnly) {
++            if (progressOcrBusy || now - lastProgressOcr < 1800L) return
++            progressOcrBusy = true
++            lastProgressOcr = now
++            progressOcr ?: WindowOcr(this, "ocr-progress-v1").also { progressOcr = it }
++        } else {
++            if (ocrBusy || now - lastOcr < 700L) return
++            ocrBusy = true
++            lastOcr = now
++            ocr ?: WindowOcr(this).also { ocr = it }
++        }
++        fun finished() {
++            if (progressOnly) progressOcrBusy = false else ocrBusy = false
++        }
+         val epoch=ocrEpoch
+         val progressGeneration = progressEpoch
+-        try{
+-            takeScreenshotOfWindow(windowId,mainExecutor,object:TakeScreenshotCallback{
+-                override fun onSuccess(result:ScreenshotResult){
+-                    if(!running || epoch!=ocrEpoch){result.hardwareBuffer.close();return}
+-                    worker.recognize(result, badgeOnly, progressOnly){reading->
+-                        ui.post {
+-                            if(epoch!=ocrEpoch)return@post
+-                            ocrBusy=false
+-                            if(!running || reading==null)return@post
+-                            val active=rootInActiveWindow
+-                            if(active?.packageName?.toString()!="ru.yandex.taximeter" || active.windowId!=windowId)return@post
+-                            if(System.currentTimeMillis()-now>5000L)return@post
+-                            if (currentNativeWindow != windowId) return@post
+-                            if (progressOnly) {
+-                                if (progressGeneration == progressEpoch && currentNativeOffer?.order != true &&
+-                                    (currentNativeText == visible || TripProgressReader.read(currentNativeText) != null)) {
+-                                    reading.progress?.let { tripProgress.update(it, System.currentTimeMillis()) }?.let {
+-                                        processDetection(it, false, rememberIncoming = false)
+-                                    }
+-                                }
+-                                return@post
+-                            }
+-                            val freshest = currentNativeOffer
+-                            val originalId = OfferPopupState.identity(original.pickup, original.destination, original.tariff)
+-                            val currentId = freshest?.let { OfferPopupState.identity(it.pickup, it.destination, it.tariff) }
+-                            val badge = reading.badge
+-                            if (badge != null && freshest?.order == true && originalId != null && originalId == currentId) {
+-                                latestBadge = originalId to badge
+-                                processDetection(detected.takeIf { it.order }?.copy(tripBadge = freshest.tripBadge ?: badge)
+-                                    ?: freshest.copy(tripBadge = freshest.tripBadge ?: badge), false)
+-                            }
+-                            if (badgeOnly || currentNativeText != visible) return@post
+-                            if (scanGeneration != generation && !detected.order) return@post
+-                            val recognized = OrderTextParser.parse(reading.text.orEmpty(), cardOnly = reading.cardOnly)
+-                            val candidate = if (reading.cardOnly) recognized
+-                                else recognized.copy(pickup = null, destination = null)
+-                            val samePickup = original.pickup == null ||
+-                                candidate.pickup?.let { OrderTextParser.samePoint(original.pickup, it) } == true
+-                            val sameDestination = original.destination == null ||
+-                                candidate.destination?.let { OrderTextParser.samePoint(original.destination, it) } == true
+-                            val merged = if (original.order) original.copy(
+-                                pickup = original.pickup ?: candidate.pickup.takeIf { candidate.order && sameDestination },
+-                                destination = original.destination ?: candidate.destination.takeIf { candidate.order && samePickup },
+-                                tariff = original.tariff ?: candidate.tariff,
+-                                displayedGross = original.displayedGross ?: candidate.displayedGross.takeIf { candidate.order },
+-                                pickupExtra = original.pickupExtra ?: candidate.pickupExtra.takeIf { candidate.order },
+-                                observedCoefficient = original.observedCoefficient ?: candidate.observedCoefficient.takeIf { candidate.order },
+-                                tripBadge = original.tripBadge ?: candidate.tripBadge ?: badge
+-                            ) else candidate.copy(tripBadge = candidate.tripBadge ?: badge)
+-                            val purple = reading.purple?.takeUnless { it == merged.pickupExtra }
+-                            val demand=OfferDemandEvidence.merge(original.demand ?: candidate.demand,purple)
+-                            if (!merged.order || merged.tariff == null || (demand == null && merged.displayedGross == null &&
+-                                    (merged.tripBadge == null && (merged.pickup == null || merged.destination == null)))) return@post
+-                            if(original.tariff!=null && original.tariff!=merged.tariff)return@post
+-                            if(original.pickup!=null && original.pickup!=merged.pickup)return@post
+-                            if(original.destination!=null && original.destination!=merged.destination)return@post
+-                            if(detected.order && detected.pickup!=null && detected.pickup!=merged.pickup)return@post
+-                            if(detected.order && detected.destination!=null && detected.destination!=merged.destination)return@post
+-                            if(detected.order && detected.tariff!=null && detected.tariff!=merged.tariff)return@post
+-                            if(!detected.order && scanGeneration!=generation)return@post
+-                            verifiedIdentity=OfferPopupState.identity(merged.pickup,merged.destination,merged.tariff)
+-                            verifiedDemand=demand;verifiedAt=System.currentTimeMillis()
+-                            val corrected = merged.copy(demand = demand)
+-                            if (original.order) {
+-                                cachedOcrOrder = OcrOrder(windowId, visible, corrected)
+-                            }
+-                            processDetection(corrected,false)
++        fun publish(reading: WindowOcr.Reading?, done: Boolean) {
++            ui.post {
++                if(epoch!=ocrEpoch)return@post
++                if (done) finished()
++                if(!running || reading==null)return@post
++                val active=rootInActiveWindow
++                if(active?.packageName?.toString()!="ru.yandex.taximeter" || active.windowId!=windowId)return@post
++                if(System.currentTimeMillis()-now>5000L)return@post
++                if (currentNativeWindow != windowId) return@post
++                if (progressOnly) {
++                    if (progressGeneration == progressEpoch && currentNativeOffer?.order != true &&
++                        (currentNativeText == visible || TripProgressReader.read(currentNativeText) != null)) {
++                        reading.progress?.let { tripProgress.update(it, System.currentTimeMillis()) }?.let {
++                            processDetection(it, false, rememberIncoming = false)
+                         }
+                     }
+-                }
+-                override fun onFailure(errorCode:Int){if(epoch==ocrEpoch)ocrBusy=false}
++                    return@post
++                }
++                val freshest = currentNativeOffer
++                val originalId = OfferPopupState.identity(original.pickup, original.destination, original.tariff)
++                val currentId = freshest?.let { OfferPopupState.identity(it.pickup, it.destination, it.tariff) }
++                val badge = reading.badge
++                if (badge != null && freshest?.order == true && originalId != null && originalId == currentId) {
++                    latestBadge = originalId to badge
++                    processDetection(detected.takeIf { it.order }?.copy(tripBadge = freshest.tripBadge ?: badge)
++                        ?: freshest.copy(tripBadge = freshest.tripBadge ?: badge), false)
++                }
++                if (badgeOnly || currentNativeText != visible) return@post
++                if (scanGeneration != generation && !detected.order) return@post
++                val recognized = OrderTextParser.parse(reading.text.orEmpty(), cardOnly = reading.cardOnly)
++                val candidate = if (reading.cardOnly) recognized
++                    else recognized.copy(pickup = null, destination = null)
++                val samePickup = original.pickup == null ||
++                    candidate.pickup?.let { OrderTextParser.samePoint(original.pickup, it) } == true
++                val sameDestination = original.destination == null ||
++                    candidate.destination?.let { OrderTextParser.samePoint(original.destination, it) } == true
++                val merged = if (original.order) original.copy(
++                    pickup = original.pickup ?: candidate.pickup.takeIf { candidate.order && sameDestination },
++                    destination = original.destination ?: candidate.destination.takeIf { candidate.order && samePickup },
++                    tariff = original.tariff ?: candidate.tariff,
++                    displayedGross = original.displayedGross ?: candidate.displayedGross.takeIf { candidate.order },
++                    pickupExtra = original.pickupExtra ?: candidate.pickupExtra.takeIf { candidate.order },
++                    observedCoefficient = original.observedCoefficient ?: candidate.observedCoefficient.takeIf { candidate.order },
++                    tripBadge = original.tripBadge ?: candidate.tripBadge ?: badge
++                ) else candidate.copy(tripBadge = candidate.tripBadge ?: badge)
++                val purple = reading.purple?.takeUnless { it == merged.pickupExtra }
++                val demand=OfferDemandEvidence.merge(original.demand ?: candidate.demand,purple)
++                if (!merged.order || merged.tariff == null || (demand == null && merged.displayedGross == null &&
++                        (merged.tripBadge == null && (merged.pickup == null || merged.destination == null)))) return@post
++                if(original.tariff!=null && original.tariff!=merged.tariff)return@post
++                if(original.pickup!=null && original.pickup!=merged.pickup)return@post
++                if(original.destination!=null && original.destination!=merged.destination)return@post
++                if(detected.order && detected.pickup!=null && detected.pickup!=merged.pickup)return@post
++                if(detected.order && detected.destination!=null && detected.destination!=merged.destination)return@post
++                if(detected.order && detected.tariff!=null && detected.tariff!=merged.tariff)return@post
++                if(!detected.order && scanGeneration!=generation)return@post
++                verifiedIdentity=OfferPopupState.identity(merged.pickup,merged.destination,merged.tariff)
++                verifiedDemand=demand;verifiedAt=System.currentTimeMillis()
++                val corrected = merged.copy(demand = demand)
++                if (original.order) {
++                    cachedOcrOrder = OcrOrder(windowId, visible, corrected)
++                }
++                processDetection(corrected,false)
++            }
++        }
++        try {
++            takeScreenshotOfWindow(windowId, mainExecutor, object : TakeScreenshotCallback {
++                override fun onSuccess(result: ScreenshotResult) {
++                    if (!running || epoch != ocrEpoch) { result.hardwareBuffer.close(); return }
++                    worker.recognize(result, badgeOnly, progressOnly,
++                        ready = { publish(it, false) }, done = { publish(it, true) })
++                }
++                override fun onFailure(errorCode: Int) { if (epoch == ocrEpoch) finished() }
+             })
+-        }catch(e:Exception){ocrBusy=false}
++        } catch (_: Exception) { finished() }
+     }
+     private fun processDetection(
+         newer: OrderTextParser.Detected, windowChanged: Boolean, rememberIncoming: Boolean = true
+@@ -446,6 +483,16 @@
+             }
+             nonOrderSnapshots=0
+             val identity = OfferPopupState.identity(newer.pickup, newer.destination, newer.tariff)
++            if (rememberIncoming && (offerStartedAt == null ||
++                (identity != null && loggedIdentity != null && identity != loggedIdentity))) {
++                offerStartedAt = android.os.SystemClock.elapsedRealtime()
++                priceDrawn = false
++                ui.removeCallbacks(offerDeadline)
++                ui.postDelayed(offerDeadline, 4_000L)
++            } else if (!rememberIncoming) {
++                offerStartedAt = null
++                ui.removeCallbacks(offerDeadline)
++            }
+             if (identity != null && identity != loggedIdentity) {
+                 loggedIdentity = identity
+                 loggedOffer = false
+@@ -585,8 +632,11 @@
+             val surchargeText = baseDemand?.takeIf { it.type == DemandType.FIXED_ADD }
+                 ?.let { "+${FareEngine.kzt(it.amount)}" }
+             val demand = listOfNotNull(coefficientText, surchargeText).joinToString(" ").ifBlank { "—" }
++            val elapsed = offerStartedAt?.let { android.os.SystemClock.elapsedRealtime() - it }
++            val shownStatus = if (estimate == null && elapsed != null && elapsed >= 4_000L &&
++                routeStatus.startsWith("Маршрут")) "За 4 сек цена не готова" else routeStatus
+             panel.showQuote(detected.tariff?.let {TarifCatalog.shortName(it)} ?: "Заказ",
+-                demand,estimate,routeStatus,
++                demand,estimate,shownStatus,
+                 detected.tariff?.let {TarifCatalog.rateExpired(it)} ?: TarifCatalog.expiredToday(),
+                 CommissionSettings.park(prefs), detected.pickup, detected.destination, detected.pickupExtra)
+         } else panel.showWaiting()
+--- a/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
++++ b/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
+@@ -8,14 +8,14 @@
+ import java.util.concurrent.Executors
+ 
+ /** Window image and recognized text exist in memory only. Only language models are stored. */
+-class WindowOcr(private val context:Context) {
++class WindowOcr(private val context:Context, private val workingDirectory: String = "ocr-v1") {
+     private val worker=Executors.newSingleThreadExecutor()
+     @Volatile private var closed=false
+     private var tess:TessBaseAPI?=null
+     private var badgeTess:TessBaseAPI?=null
+     private fun engine(badgeOnly: Boolean = false):TessBaseAPI {
+         (if (badgeOnly) badgeTess else tess)?.let { return it }
+-        val home=File(context.filesDir,"ocr-v1")
++        val home=File(context.filesDir,workingDirectory)
+         val data=File(home,"tessdata").apply{mkdirs()}
+         val languages = if (badgeOnly) listOf("rus") else listOf("rus", "kaz", "eng")
+         for (lang in languages){
+@@ -42,7 +42,10 @@
+         }
+     }
+ 
+-    fun recognize(result:AccessibilityService.ScreenshotResult,badgeOnly:Boolean,progressOnly:Boolean,done:(Reading?)->Unit){
++    fun recognize(
++        result: AccessibilityService.ScreenshotResult, badgeOnly: Boolean, progressOnly: Boolean,
++        ready: (Reading) -> Unit, done: (Reading?) -> Unit
++    ){
+         val buffer=result.hardwareBuffer
+         if(closed){buffer.close();done(null);return}
+         try{
+@@ -60,11 +63,15 @@
+                         bitmap=hw?.copy(Bitmap.Config.ARGB_8888,false)
+                         if(bitmap!=null && !closed){
+                             if (progressOnly) progress = readProgress(bitmap, engine(badgeOnly = true))
+-                            else badge = readTripBadge(bitmap, engine(badgeOnly = true))
++                            else {
++                                badge = readTripBadge(bitmap, engine(badgeOnly = true))
++                                if (badge != null && !badgeOnly) ready(Reading(null, null, false, badge, null))
++                            }
+                             if (!badgeOnly && !progressOnly) {
+                                 val api = engine()
+                                 text = readOrderCard(bitmap, api)
+                                 cardOnly = text != null
++                                if (cardOnly) ready(Reading(text, null, true, badge, null))
+                                 if (text == null) {
+                                     api.setImage(bitmap)
+                                     try {
