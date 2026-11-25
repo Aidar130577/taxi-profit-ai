@@ -70,12 +70,12 @@ jobs:
                   c,RoutingEngine.BROUTER_ENGINEMODE_ROUTING);
                 engine.quite=true;
                 engine.doRun(shortest?3000:2000);
-                var t=engine.foundTrack;
-                boolean ok=t!=null && t.distance>=20 && t.totalSeconds>0 && t.nodes.size()>=2;
+                var t=engine.getFoundTrack();
+                boolean ok=t!=null && t.distance>=20 && t.getTotalSeconds()>0 && t.nodes.size()>=2;
                 double elapsed=(System.nanoTime()-begin)/1e6;
                 st.add(elapsed,ok);
                 System.out.printf(Locale.ROOT,"CASE,%d,%d,%d,%s,%.3f,%s,%s,%s%n",
-                  rep,i,j,shortest,elapsed,ok,ok?t.distance:"-",ok?t.totalSeconds:"-");
+                  rep,i,j,shortest,elapsed,ok,ok?t.distance:"-",ok?t.getTotalSeconds():"-");
                 return ok?t.distance:Double.NaN;
               }catch(Exception e){
                 double elapsed=(System.nanoTime()-begin)/1e6;
