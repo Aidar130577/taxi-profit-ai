@@ -1,0 +1,216 @@
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupState.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupState.kt
+@@ -38,3 +38,50 @@
+         }
+     }
+ }
++
++/** A trip price has one display window, independent of transient Android window snapshots. */
++class AcceptedFarePopupState {
++    private var identity: String? = null
++    private var destination: String? = null
++    private var shown = false
++    private var until = 0L
++    var accepted = false
++        private set
++
++    fun accept(stableIdentity: String?, place: String?) {
++        accepted = true
++        if (identity == null) identity = stableIdentity
++        if (destination == null) destination = place
++    }
++
++    fun allowsIncoming(stableIdentity: String?, place: String?): Boolean {
++        if (!accepted) return true
++        if (stableIdentity == null) return false
++        val known = identity
++        val target = destination
++        val different = if (known != null) stableIdentity != known
++            else target != null && place != null && !OrderTextParser.samePoint(target, place)
++        if (different) clear()
++        return different
++    }
++
++    fun showOnce(now: Long): Boolean {
++        if (!accepted || shown) return false
++        shown = true
++        until = now + DISPLAY_MS
++        return true
++    }
++
++    fun isShowing(now: Long) = shown && now < until
++    fun needsPrice() = accepted && !shown
++    fun dismiss() { until = 0L }
++    fun clear() {
++        accepted = false
++        identity = null
++        destination = null
++        shown = false
++        until = 0L
++    }
++
++    companion object { const val DISPLAY_MS = 4_000L }
++}
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -77,6 +77,11 @@
+     }
+     private var detected=OrderTextParser.Detected(false,null,null,false,null,null,null,null)
+     private val offerPopupState=OfferPopupState()
++    private val acceptedFare = AcceptedFarePopupState()
++    private val acceptedFareTimeout = Runnable {
++        render()
++        Log.i("ZnayTsenuService", "Accepted fare returned to waiting")
++    }
+     private var popup: OfferPopupView?=null
+     private var nonOrderSnapshots=0
+     private fun dp(n: Int): Int = (n * resources.displayMetrics.density + 0.5f).toInt()
+@@ -142,6 +147,8 @@
+         running = false
+         rideTiming.reset()
+         tripProgress.clear()
++        acceptedFare.clear()
++        ui.removeCallbacks(acceptedFareTimeout)
+         RideGpsService.stop(this)
+         cancelScan()
+         windowChangedSinceScan = false
+@@ -188,7 +195,10 @@
+         var initialY = 0
+         var moving = false
+         panel.setOnClickListener {
+-            offerPopupState.dismiss()
++            if (acceptedFare.accepted) {
++                acceptedFare.dismiss()
++                ui.removeCallbacks(acceptedFareTimeout)
++            } else offerPopupState.dismiss()
+             render()
+         }
+         panel.setOnTouchListener { _, event ->
+@@ -296,6 +306,8 @@
+         if (root.packageName?.toString() != driverPackage) {
+             if (popup != null) {
+                 scanGeneration++
++                acceptedFare.dismiss()
++                ui.removeCallbacks(acceptedFareTimeout)
+                 closeOffer()
+                 hideFarePopup()
+             }
+@@ -338,6 +350,8 @@
+         RideGpsService.record(rideTiming.active)
+         if (ridePhase == RidePhase.CANCELLED || ridePhase == RidePhase.COMPLETED) {
+             tripProgress.clear()
++            acceptedFare.clear()
++            ui.removeCallbacks(acceptedFareTimeout)
+             progressEpoch++
+             closeOffer()
+             render()
+@@ -359,13 +373,19 @@
+         if (latestBadge?.first != identity) latestBadge = null
+         val newer = current.copy(tripBadge = native.tripBadge ?: current.tripBadge ?: latestBadge?.second)
+         val phase = TripProgressReader.read(visible, selectedRoutes.singleOrNull())
+-        if (!newer.order && (phase != null || tripProgress.hasContext(now))) {
+-            val savedQuote = phase?.let { tripProgress.update(it, now) }
+-            if (savedQuote != null) processDetection(savedQuote, false, rememberIncoming = false)
+-            if (phase == null || (phase.selecting && phase.route == null) || (!phase.selecting && phase.gross == null)) {
++        if (!newer.order || !acceptedFare.allowsIncoming(identity, newer.destination)) {
++            if (ridePhase == RidePhase.READY || ridePhase == RidePhase.ACTIVE) {
++                beginAccepted(loggedIdentity, destinations.singleOrNull())
++            }
++            if (phase != null) handleTripProgress(phase)
++            if ((acceptedFare.needsPrice() || (!acceptedFare.accepted && tripProgress.hasContext(now))) &&
++                (phase == null || phase.gross == null)) {
+                 tryOcr(root.windowId, ++scanGeneration, now, visible, native, badgeOnly = false, progressOnly = true)
+             }
+-            if (savedQuote != null || phase != null) return
++            if (acceptedFare.accepted) {
++                render()
++                return
++            }
+         }
+         val generation=++scanGeneration
+         val incomplete = newer.tariff == null || (newer.displayedGross == null &&
+@@ -411,9 +431,7 @@
+                 if (progressOnly) {
+                     if (progressGeneration == progressEpoch && currentNativeOffer?.order != true &&
+                         (currentNativeText == visible || TripProgressReader.read(currentNativeText) != null)) {
+-                        reading.progress?.let { tripProgress.update(it, System.currentTimeMillis()) }?.let {
+-                            processDetection(it, false, rememberIncoming = false)
+-                        }
++                        reading.progress?.let(::handleTripProgress)
+                     }
+                     return@post
+                 }
+@@ -475,11 +493,36 @@
+             })
+         } catch (_: Exception) { finished() }
+     }
++    private fun beginAccepted(identity: String?, destination: String?) {
++        if (!acceptedFare.accepted) {
++            val knownDestination = destination ?: detected.destination
++            acceptedFare.accept(identity, knownDestination)
++            closeOffer()
++            render()
++        } else acceptedFare.accept(identity, destination)
++    }
++
++    private fun handleTripProgress(progress: TripProgress) {
++        val quote = tripProgress.update(progress, System.currentTimeMillis())
++        val identity = quote?.let { OfferPopupState.identity(it.pickup, it.destination, it.tariff) }
++        beginAccepted(identity ?: loggedIdentity, quote?.destination ?: progress.destination)
++        if (progress.selecting || progress.gross == null || quote == null) return
++        if (!acceptedFare.showOnce(android.os.SystemClock.elapsedRealtime())) return
++        processDetection(quote, false, rememberIncoming = false)
++        Log.i("ZnayTsenuService", "Accepted fare opened once")
++        ui.removeCallbacks(acceptedFareTimeout)
++        ui.postDelayed(acceptedFareTimeout, AcceptedFarePopupState.DISPLAY_MS)
++    }
++
+     private fun processDetection(
+         newer: OrderTextParser.Detected, windowChanged: Boolean, rememberIncoming: Boolean = true
+     ){
+         if(newer.order) {
++            if (rememberIncoming && !acceptedFare.allowsIncoming(
++                    OfferPopupState.identity(newer.pickup, newer.destination, newer.tariff), newer.destination
++                )) return
+             if (rememberIncoming) {
++                ui.removeCallbacks(acceptedFareTimeout)
+                 val now = System.currentTimeMillis()
+                 tripProgress.remember(newer, now)
+                 progressEpoch++
+@@ -627,7 +670,9 @@
+ 
+     private fun render() {
+         val panel = popup ?: return
+-        if (detected.order && offerPopupState.shouldShow()) {
++        val showing = if (acceptedFare.accepted) acceptedFare.isShowing(android.os.SystemClock.elapsedRealtime())
++            else offerPopupState.shouldShow()
++        if (detected.order && showing) {
+             val baseDemand = detected.demand
+             val coefficient = detected.observedCoefficient
+                 ?: baseDemand?.takeIf { it.type == DemandType.MULTIPLIER }?.amount
+--- a/core-tests/OfferPopupCheck.kt
++++ b/core-tests/OfferPopupCheck.kt
+@@ -28,5 +28,23 @@
+     ok(s.shouldShow(),"new occurrence of same route can be shown")
+     ok(OfferPopupState.identity(null,"Аэропорт","Business")==null,"null pickup no identity")
+     ok(OfferPopupState.identity("А","Б",null)==null,"null tariff no identity")
++    val accepted = AcceptedFarePopupState()
++    ok(!accepted.showOnce(1000), "only accepted trips can show the final quote")
++    accepted.accept(a, "Аэропорт Алматы")
++    ok(accepted.needsPrice(), "waits for actual price")
++    ok(!accepted.allowsIncoming(null, null), "partial snapshot cannot reopen a trip")
++    ok(!accepted.allowsIncoming(a, "Аэропорт Алматы"), "stale original card is ignored")
++    ok(accepted.showOnce(2000) && accepted.isShowing(5999), "accepted price shows for four seconds")
++    accepted.accept(a, "Аэропорт Алматы")
++    ok(!accepted.showOnce(5000), "updates never extend the display window")
++    ok(!accepted.isShowing(6000), "returns to waiting at the deadline")
++    ok(!accepted.showOnce(7000), "same trip stays collapsed")
++    ok(accepted.allowsIncoming(b, "Жандосова, 2"), "new offer can be displayed")
++    accepted.accept(b, "Жандосова, 2")
++    ok(accepted.showOnce(8000), "new trip gets its own one-time display")
++    accepted.dismiss()
++    ok(!accepted.isShowing(8001) && !accepted.showOnce(8002), "manual collapse stays collapsed")
++    accepted.clear()
++    ok(accepted.allowsIncoming(b, "Жандосова, 2"), "a completed trip allows a repeat route")
+     println("OfferPopup: $passed checks OK")
+ }

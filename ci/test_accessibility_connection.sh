@@ -49,6 +49,7 @@ XML
 package ru.yandex.taximeter;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.os.Bundle;
 import android.widget.TextView;
 
@@ -56,9 +57,25 @@ public final class FixtureActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        show(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        show(intent);
+    }
+
+    private void show(Intent intent) {
         TextView screen = new TextView(this);
-        screen.setText("Пропустить\nБ 12 км 1 ч 20 мин\n500 м · 4 мин\nБлижняя подача\nКомфорт+\n"
-            + "А: улица Тестовая, 135\nБ: Центральная улица, 8\nПассажир\nПринять ×1.00");
+        if (intent.getBooleanExtra("accepted", false)) {
+            screen.setText("Б: Центральная улица, 8 04:43\nОплата картой 4090т\n"
+                + "Стоимость поездки с учетом пробок\nПассажир\nКомфорт+\nОжидание\nЗавершить\n"
+                + intent.getIntExtra("frame", 0));
+        } else {
+            screen.setText("Пропустить\nБ 12 км 1 ч 20 мин\n500 м · 4 мин\nБлижняя подача\nКомфорт+\n"
+                + "А: улица Тестовая, 135\nБ: Центральная улица, 8\nПассажир\nПринять ×1.00");
+        }
         setContentView(screen);
     }
 }
@@ -133,3 +150,13 @@ adb logcat -c
 enable_service
 wait_for_log "Order overlay attached"
 echo "Service connection, overlay and reconnect verified on API $api"
+
+
+adb shell am start -W -n "$driver_package/.FixtureActivity" --activity-single-top --ez accepted true
+wait_for_log "Accepted fare opened once"
+wait_for_log "Accepted fare returned to waiting"
+adb shell am start -W -n "$driver_package/.FixtureActivity" --activity-single-top --ez accepted true --ei frame 1
+sleep 2
+count=$(adb logcat -d -s "$log_tag:V" | grep -c 'Accepted fare opened once')
+test "$count" -eq 1
+echo "Accepted price displayed once, then stayed collapsed after refresh on Android API $api"
