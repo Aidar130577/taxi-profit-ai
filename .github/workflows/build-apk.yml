@@ -126,6 +126,7 @@ jobs:
           python3 ../patches/hyperos_recovery_v44.py
           python3 ../patches/unified_learning_v44.py
           python3 ../patches/route_diagnostics_v45.py
+          python3 ../patches/shortest_route_v45.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -210,6 +211,7 @@ jobs:
           unzip -l "$APK" | grep ic_launcher
           unzip -l "$APK" | grep "assets/almaty-osm.sqlite"
           unzip -l "$APK" | grep "assets/brouter/E75_N40.rd5"
+          unzip -l "$APK" | grep "assets/brouter/car-shortest-znay-v45.brf"
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | tee apk-signing.txt
