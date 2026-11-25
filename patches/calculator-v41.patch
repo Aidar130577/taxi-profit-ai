@@ -1,0 +1,427 @@
+--- a/app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt
++++ b/app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt
+@@ -1,7 +1,26 @@
+ package kz.taxiprofitai
+ 
+ /** Independently testable reader of BRouter's GeoJSON track properties. */
+-data class OfflineRoute(val km: Double, val minutes: Double, val source: String = "BRouter • без живых пробок")
++data class OfflineRoute(val km: Double, val minutes: Double, val source: String = "BRouter • без живых пробок",
++    val provisional: Boolean = false)
++internal object FastRouteEstimate {
++    const val SHOW_AFTER_MS = 650L
++
++    fun between(latA: Double, lonA: Double, latB: Double, lonB: Double): OfflineRoute? {
++        val latDelta = Math.toRadians(latB - latA)
++        val lonDelta = Math.toRadians(lonB - lonA)
++        val a = Math.toRadians(latA)
++        val b = Math.toRadians(latB)
++        val chord = kotlin.math.sin(latDelta / 2).let { it * it } +
++            kotlin.math.cos(a) * kotlin.math.cos(b) * kotlin.math.sin(lonDelta / 2).let { it * it }
++        val directKm = 12_742 * kotlin.math.asin(kotlin.math.sqrt(chord.coerceIn(0.0, 1.0)))
++        if (directKm !in 0.12..25.0) return null
++        // Approximate urban road distance and 30 km/h. The road router replaces both figures.
++        val km = directKm * 1.35
++        return OfflineRoute(km, maxOf(2.0, km * 2), "Предварительно · без маршрута", provisional = true)
++    }
++}
++
+ object BRouterRouteResult {
+     // Exact keys emitted by BRouter FormatJson: track-length (metres), total-time (seconds).
+     private val distancePattern = Regex("\"track-length\"\\s*:\\s*\"?(\\d+(?:\\.\\d+)?)\"?")
+--- a/app/src/main/java/kz/taxiprofitai/LearnedRates.kt
++++ b/app/src/main/java/kz/taxiprofitai/LearnedRates.kt
+@@ -22,6 +22,7 @@
+                 it.fixedSurcharge != null && it.demandMultiplier != null
+         }.mapNotNull { row ->
+             val metered = row.metered
++            if (!metered && row.provisional && (row.routeKm == null || row.routeMinutes == null)) return@mapNotNull null
+             val km = if (metered) row.actualKm else row.routeKm ?: row.km
+             val minutes = if (metered) row.actualMinutes else row.routeMinutes ?: row.minutes
+             val gross = row.actualGross!!
+--- a/app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt
++++ b/app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt
+@@ -29,7 +29,8 @@
+     val receiptId: String? = null,
+     val excluded: Boolean = false,
+     val offlineKm: Double? = null,
+-    val metered: Boolean = false
++    val metered: Boolean = false,
++    val provisional: Boolean = false
+ )
+ 
+ /** Adapts the v4 temporal validation to one driver's confirmed trips. */
+--- a/app/src/main/java/kz/taxiprofitai/MainActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/MainActivity.kt
+@@ -329,7 +329,7 @@
+                     val source = if (row.priceSource == FareFactSource.MANUAL) "Введено вручную" else "Яндекс Про"
+                     "$source ${FareEngine.kzt(it)}"
+                 }
+-                val forecast = if (row.hasForecast) "Прогноз ${FareEngine.kzt(row.forecastGross)}" else "Прогноз отсутствовал"
++                val forecast = if (row.hasForecast) "${if (row.provisional) "Первый прогноз ≈" else "Прогноз "}${FareEngine.kzt(row.forecastGross)}" else "Прогноз отсутствовал"
+                 val error = row.actualGross?.takeIf { row.hasForecast && !row.excluded }?.let {
+                     val pct = (row.forecastGross - it) * 100 / it
+                     "Ошибка ${"%+.1f".format(pct)}%"
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
+@@ -104,6 +104,7 @@
+             status.startsWith("Не считан") || status == "Тариф не считан" -> status
+             status.startsWith("Адрес не найден") || status == "Уточните название места" -> status
+             status.startsWith("Нет маршрута") -> "Нет маршрута BRouter"
++            status.startsWith("Предварительно") || status == "Ошибка тарифной модели" -> status
+             status.startsWith("Маршрут") -> "Считаем…"
+             status == "Учтён опыт поездок" || status == "Время скорректировано" -> status
+             status == "База комиссии неизвестна" || status == "За 4 сек цена не готова" || status == "Время Яндекс Про" || status == "Цена Яндекс Про" -> status
+--- a/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
+@@ -15,8 +15,9 @@
+     private val geocodeWorker = Executors.newFixedThreadPool(2)
+     private val brouter = BRouterConnector(appContext)
+     private val offlineAlmaty = OfflineAlmatyIndex(appContext)
+-    private val pointCache = object: LinkedHashMap<String,BRouterConnector.Point>(32,0.75f,true) {
+-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String,BRouterConnector.Point>?): Boolean = size > 32
++    private data class Resolved(val point: BRouterConnector.Point, val exact: Boolean)
++    private val pointCache = object: LinkedHashMap<String,Resolved>(32,0.75f,true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String,Resolved>?): Boolean = size > 32
+     }
+     @Volatile private var closed = false
+     // Entire routes stay in the short-lived in-memory cache.
+@@ -24,7 +25,11 @@
+         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String,Pair<Long,OfflineRoute>>?): Boolean = size > 20
+     }
+     // Only accessed from the main thread. Identical lookups share the in-flight result.
+-    private val pendingRoutes = mutableMapOf<String, MutableList<(Result<OfflineRoute>) -> Unit>>()
++    private class Request(
++        val preview: ((OfflineRoute) -> Unit)?, val finish: (Result<OfflineRoute>) -> Unit
++    )
++    private class Pending(val requests: MutableList<Request>, var preview: OfflineRoute? = null)
++    private val pendingRoutes = mutableMapOf<String, Pending>()
+     private val routeTtlMs = 5 * 60 * 1000L
+ 
+     fun prepare() {
+@@ -37,7 +42,8 @@
+         }
+     }
+ 
+-    fun calculate(a: String, b: String, callback: (Result<OfflineRoute>) -> Unit) {
++    fun calculate(a: String, b: String, preview: ((OfflineRoute) -> Unit)? = null,
++                  callback: (Result<OfflineRoute>) -> Unit) {
+         if (closed) return
+         val key = a.trim().lowercase(Locale.ROOT) + "|" + b.trim().lowercase(Locale.ROOT)
+         val existing = synchronized(routeCache) { routeCache[key] }
+@@ -46,10 +52,11 @@
+             return
+         }
+         pendingRoutes[key]?.let {
+-            it.add(callback)
++            it.requests.add(Request(preview, callback))
++            it.preview?.let { route -> preview?.invoke(route) }
+             return
+         }
+-        pendingRoutes[key] = mutableListOf(callback)
++        pendingRoutes[key] = Pending(mutableListOf(Request(preview, callback)))
+         val from = CompletableFuture.supplyAsync({ runCatching { resolve(a) } }, geocodeWorker)
+         val to = CompletableFuture.supplyAsync({ runCatching { resolve(b) } }, geocodeWorker)
+         from.thenCombine(to) { start, end -> runCatching { start.getOrThrow() to end.getOrThrow() } }
+@@ -60,7 +67,18 @@
+                         complete(key, Result.failure(error ?: IllegalStateException("Не удалось найти адреса")))
+                     } else {
+                         pair.fold(
+-                            onSuccess = { (p1, p2) -> brouter.route(p1, p2) { complete(key, it) } },
++                            onSuccess = { (from, to) ->
++                                if (from.exact && to.exact) {
++                                    FastRouteEstimate.between(from.point.lat, from.point.lon, to.point.lat, to.point.lon)
++                                        ?.let { route ->
++                                            pendingRoutes[key]?.let { pending ->
++                                                pending.preview = route
++                                                pending.requests.toList().forEach { it.preview?.invoke(route) }
++                                            }
++                                        }
++                                }
++                                brouter.route(from.point, to.point) { complete(key, it) }
++                            },
+                             onFailure = { complete(key, Result.failure(it)) }
+                         )
+                     }
+@@ -71,16 +89,17 @@
+     private fun complete(key: String, result: Result<OfflineRoute>) {
+         if (closed) return
+         result.onSuccess { route -> synchronized(routeCache) { routeCache[key] = System.currentTimeMillis() to route } }
+-        pendingRoutes.remove(key)?.forEach { it(result) }
++        pendingRoutes.remove(key)?.requests?.forEach { it.finish(result) }
+     }
+ 
+-    private fun resolve(raw: String): BRouterConnector.Point {
++    private fun resolve(raw: String): Resolved {
+         val norm=raw.trim().lowercase(Locale.ROOT)
+         synchronized(pointCache) { pointCache[norm]?.let { return it } }
+         // Explicit coordinates are helpful for a completely offline routing test, without any geocoder.
+         val match=Regex("^\\s*(4[23]\\.\\d{3,}),\\s*(7[567]\\.\\d{3,})\\s*$").find(norm)
+-        val found=if(match!=null) BRouterConnector.Point(match.groupValues[1].toDouble(),match.groupValues[2].toDouble())
+-        else offlineAlmaty.find(raw) ?: LearnedPlaces.find(appContext, raw) ?: run {
++        val offline = if (match != null) BRouterConnector.Point(match.groupValues[1].toDouble(), match.groupValues[2].toDouble())
++            else offlineAlmaty.find(raw) ?: LearnedPlaces.find(appContext, raw)
++        val found = offline?.let { Resolved(it, exact = true) } ?: run {
+             @Suppress("DEPRECATION")
+             val geocoder=Geocoder(appContext,Locale("ru","KZ"))
+             val queries = PlaceLookup.queries(raw)
+@@ -95,21 +114,20 @@
+                             listOfNotNull(address.featureName, address.premises, address.getAddressLine(0)))
+                     }
+             }.map { matches ->
+-                if (named) PlaceLookup.namedMatch(queries.last(), matches)
+-                else {
+-                    val exact = matches.filter { candidate -> candidate.labels.any { label ->
+-                        val address = label.split(',').take(2).joinToString(",").trim()
+-                        OrderTextParser.samePoint(raw, address)
+-                    } }
+-                    exact.singleOrNull()?.also {
+-                        LearnedPlaces.remember(appContext, raw, BRouterConnector.Point(it.lat, it.lon), verified = true)
+-                    } ?: matches.firstOrNull()
++                val exact = if (named) PlaceLookup.namedMatch(queries.last(), matches) else matches.filter { candidate ->
++                    candidate.labels.any { label ->
++                        OrderTextParser.samePoint(raw, label.split(',').take(2).joinToString(",").trim())
++                    }
++                }.singleOrNull()
++                val match = exact ?: matches.firstOrNull().takeUnless { named }
++                match?.let { candidate ->
++                    val point = BRouterConnector.Point(candidate.lat, candidate.lon)
++                    if (exact != null) LearnedPlaces.remember(appContext, raw, point, verified = true)
++                    Resolved(point, exact != null)
+                 }
+             }.firstOrNull { it != null }
+                 ?: error(if (named) "Место не найдено однозначно" else "Не удалось найти адрес: $raw")
+-            BRouterConnector.Point(found.lat, found.lon).also {
+-                if (named) LearnedPlaces.remember(appContext, raw, it, verified = true)
+-            }
++            found
+         }
+         synchronized(pointCache) { pointCache[norm]=found }
+         return found
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -300,7 +300,7 @@
+             scanSafely(retryIfMissing = true)
+         } else {
+             val elapsed = android.os.SystemClock.elapsedRealtime() - lastScan
+-            scheduleScan((180L - elapsed).coerceAtLeast(0L))
++            scheduleScan((90L - elapsed).coerceAtLeast(0L))
+         }
+     }
+ 
+@@ -653,8 +653,11 @@
+                         profile != null -> "Учтён опыт поездок"
+                         else -> route.source
+                     }
+-                    if (rememberIncoming && identity != null) logForecast(newer, rate, quote, 0.0, weather, route.source,
+-                        android.os.SystemClock.elapsedRealtime() - (offerStartedAt ?: android.os.SystemClock.elapsedRealtime()))
++                    if (rememberIncoming && identity != null) {
++                        if (loggedOffer) detected.trialId?.let { TrialStore.observeRoute(this, it, route, route) }
++                        else logForecast(newer, rate, quote, 0.0, weather, route.source,
++                            android.os.SystemClock.elapsedRealtime() - (offerStartedAt ?: android.os.SystemClock.elapsedRealtime()))
++                    }
+                 } else if (newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank() || rate == null) {
+                     routeStatus = when {
+                         newer.pickup == null && newer.destination == null -> "Не считаны адреса А и Б"
+@@ -666,44 +669,69 @@
+                     routeStatus = "Маршрут рассчитывается..."
+                     val calcStartedAt = android.os.SystemClock.elapsedRealtime()
+                     val pipeline = routePipeline ?: OfflineRoutePipeline(this).also { routePipeline = it }
+-                    pipeline.calculate(newer.pickup, newer.destination) { result ->
++                    var finishedRoute = false
++                    val submit = submit@{ route: OfflineRoute ->
++                        val observedDemand = newer.demand
++                        val demand = observedDemand ?: Demand(DemandType.NONE)
++                        val history = TrialStore.read(this)
++                        val now = System.currentTimeMillis()
++                        val weather = CityWeather.condition(this, now)
++                        val adjusted = if (route.provisional) route else {
++                            val km = RideTimeLearning.distance(route.km, history, now)
++                            val distance = route.copy(km = km)
++                            distance.copy(minutes = RideTimeLearning.estimate(distance, history, now, weather))
++                        }
++                        val profile = learnedProfile(rate, history, now)
++                        val effective = profile?.rateFor(adjusted.km) ?: rate
++                        val quote = runCatching {
++                            RouteFareEstimator.calculateWithCommission(effective, adjusted, demand, yandex, park,
++                                loyalty, newer.verifiedHighDemandDiscount, pickupExtras(newer))
++                        }.getOrElse {
++                            if (estimate == null) {
++                                routeStatus = "Ошибка тарифной модели"
++                                render()
++                            }
++                            return@submit
++                        }
++                        estimate = quote
++                        routeStatus = when {
++                            route.provisional && observedDemand == null -> "Предварительно · без надбавки"
++                            route.provisional -> route.source
++                            observedDemand == null -> "Надбавка неизвестна"
++                            profile != null -> "Учтён опыт поездок"
++                            kotlin.math.abs(adjusted.minutes - route.minutes) >= 0.01 -> "Время скорректировано"
++                            else -> "Офлайн BRouter • без живых пробок"
++                        }
++                        if (!loggedOffer) {
++                            logForecast(newer, rate, quote, if (route.provisional) 0.0 else route.minutes,
++                                weather, route.source,
++                                android.os.SystemClock.elapsedRealtime() - (offerStartedAt ?: calcStartedAt),
++                                route.km.takeUnless { route.provisional }, route.provisional)
++                        } else if (!route.provisional) {
++                            detected.trialId?.let { TrialStore.observeRoute(this, it, adjusted, route) }
++                        }
++                        render()
++                    }
++                    pipeline.calculate(newer.pickup, newer.destination, preview = { route ->
++                        val elapsed = android.os.SystemClock.elapsedRealtime() - (offerStartedAt ?: calcStartedAt)
++                        ui.postDelayed({
++                            if (running && routeGeneration == generation && !finishedRoute && estimate == null) submit(route)
++                        }, (FastRouteEstimate.SHOW_AFTER_MS - elapsed).coerceAtLeast(0L))
++                    }) { result ->
+                         if (!running || routeGeneration != generation) return@calculate
+                         result.fold(onSuccess = { route ->
+-                            val observedDemand = newer.demand
+-                            val demand = observedDemand ?: Demand(DemandType.NONE)
+-                            val history = TrialStore.read(this)
+-                            val now = System.currentTimeMillis()
+-                            val weather = CityWeather.condition(this, now)
+-                            val km = RideTimeLearning.distance(route.km, history, now)
+-                            val adjustedRoute = route.copy(km = km)
+-                            val minutes = RideTimeLearning.estimate(adjustedRoute, history, now, weather)
+-                            val timedRoute = adjustedRoute.copy(minutes = minutes)
+-                            val timeAdjusted = kotlin.math.abs(minutes - route.minutes) >= 0.01
+-                            val profile = learnedProfile(rate, history, now)
+-                            val effective = profile?.rateFor(timedRoute.km) ?: rate
+-                            val raw = runCatching {
+-                                RouteFareEstimator.calculateWithCommission(effective, timedRoute, demand, yandex, park,
+-                                    loyalty, newer.verifiedHighDemandDiscount,
+-                                    pickupExtras(newer))
+-                            }.getOrNull()
+-                            estimate = raw
+-                            if (raw != null) logForecast(newer, rate, raw, route.minutes, weather, raw.source,
+-                                android.os.SystemClock.elapsedRealtime() - (offerStartedAt ?: calcStartedAt), route.km)
+-                            routeStatus = when {
+-                                raw == null -> "Ошибка тарифной модели"
+-                                observedDemand == null -> "Надбавка неизвестна"
+-                                profile != null -> "Учтён опыт поездок"
+-                                timeAdjusted -> "Время скорректировано"
+-                                else -> "Офлайн BRouter • без живых пробок"
+-                            }
++                            finishedRoute = true
++                            submit(route)
+                         }, onFailure = {
+-                            routeStatus = when {
+-                                result.exceptionOrNull()?.message == "Место не найдено однозначно" -> "Уточните название места"
+-                                result.exceptionOrNull()?.message?.startsWith("Не удалось найти адрес") == true -> "Адрес не найден на карте"
+-                                else -> "Нет маршрута BRouter"
++                            if (estimate == null) {
++                                routeStatus = when {
++                                    result.exceptionOrNull()?.message == "Место не найдено однозначно" -> "Уточните название места"
++                                    result.exceptionOrNull()?.message?.startsWith("Не удалось найти адрес") == true -> "Адрес не найден на карте"
++                                    else -> "Нет маршрута BRouter"
++                                }
++                                render()
+                             }
+                         })
+-                        render()
+                     }
+                 }
+             }
+@@ -748,11 +776,12 @@
+     }
+ 
+     private fun logForecast(offer: OrderTextParser.Detected, rate: TariffRate, estimate: LiveFareEstimate,
+-                            offlineMinutes: Double, weather: RideWeather, source: String, latency: Long, offlineKm: Double? = null) {
++                            offlineMinutes: Double, weather: RideWeather, source: String, latency: Long, offlineKm: Double? = null,
++                            provisional: Boolean = false) {
+         val destination = offer.destination ?: return
+         if (loggedOffer || !offerPopupState.shouldShow()) return
+         val id = TrialStore.append(this, rate.title, estimate, source, latency,
+-            knownSurcharge(offer), offlineMinutes, weather, knownMultiplier(offer), offlineKm)
++            knownSurcharge(offer), offlineMinutes, weather, knownMultiplier(offer), offlineKm, provisional)
+         val linked = offer.copy(trialId = id)
+         tripProgress.remember(linked, System.currentTimeMillis())
+         detected = linked
+--- a/app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt
++++ b/app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt
+@@ -28,7 +28,8 @@
+             val minutes = row.actualMinutes
+             val sourceMinutes = row.offlineMinutes ?: row.minutes
+             val trip = Instant.ofEpochMilli(row.createdAtMs).atZone(city)
+-            !row.excluded && row.createdAtMs in (now - retention)..now && period(local.hour, local.minute) == period(trip.hour, trip.minute) && row.weather == weather &&
++            !row.excluded && (!row.provisional || row.offlineMinutes?.let { it > 0 } == true) &&
++                row.createdAtMs in (now - retention)..now && period(local.hour, local.minute) == period(trip.hour, trip.minute) && row.weather == weather &&
+                 row.km in (route.km * 0.55)..(route.km * 1.8) &&
+                 (row.actualKm == null || row.actualKm in (row.km * 0.75)..(row.km * 1.25)) &&
+                 sourceMinutes > 0 && minutes != null && minutes in 0.5..240.0 &&
+--- a/app/src/main/java/kz/taxiprofitai/TrialStore.kt
++++ b/app/src/main/java/kz/taxiprofitai/TrialStore.kt
+@@ -44,7 +44,8 @@
+                     obj.optString("receiptId").takeIf(String::isNotBlank),
+                     obj.optBoolean("excluded"),
+                     obj.optDouble("offlineKm").takeIf(Double::isFinite),
+-                    obj.optBoolean("metered")
++                    obj.optBoolean("metered"),
++                    obj.optBoolean("provisional")
+                 )
+             }.getOrNull()
+             if (row != null && row.forecastGross.isFinite() && row.forecastGross >= 0) rows.add(row)
+@@ -55,7 +56,7 @@
+     @Synchronized fun append(context: Context, tariff: String, result: LiveFareEstimate,
+                              demand: String, latencyMs: Long, fixedSurcharge: Double? = null,
+                              offlineMinutes: Double = result.minutes, weather: RideWeather = RideWeather.UNKNOWN,
+-                             multiplier: Double? = null, offlineKm: Double? = null): Long {
++                             multiplier: Double? = null, offlineKm: Double? = null, provisional: Boolean = false): Long {
+         val now=System.currentTimeMillis()
+         val old=read(context)
+         val id = maxOf(now, (old.maxOfOrNull { it.id } ?: 0) + 1)
+@@ -63,7 +64,8 @@
+             latencyMs=latencyMs.coerceAtLeast(0L), fixedSurcharge=fixedSurcharge,
+             tariffRevision=TarifCatalog.lastVerified.takeIf { fixedSurcharge != null },
+             offlineMinutes = offlineMinutes, weather = weather, demandMultiplier = multiplier, offlineKm = offlineKm,
+-            routeKm = result.km.takeIf { it > 0.0 }, routeMinutes = result.minutes.takeIf { it > 0.0 })
++            routeKm = result.km.takeIf { !provisional && it > 0.0 },
++            routeMinutes = result.minutes.takeIf { !provisional && it > 0.0 }, provisional = provisional)
+         write(context,(listOf(row)+old).take(LIMIT))
+         return id
+     }
+@@ -93,6 +95,15 @@
+             priceSource = FareFactSource.FIXED
+         )
+         if (updated != row) write(context, rows.map { if (it.id == id) updated else it })
++    }
++
++    @Synchronized fun observeRoute(context: Context, id: Long, planned: OfflineRoute, offline: OfflineRoute) {
++        val rows = read(context)
++        val row = rows.firstOrNull { it.id == id && it.provisional } ?: return
++        if (row.routeKm != null && row.routeMinutes != null) return
++        val updated = row.copy(routeKm = planned.km, routeMinutes = planned.minutes,
++            offlineKm = offline.km, offlineMinutes = offline.minutes)
++        write(context, rows.map { if (it.id == id) updated else it })
+     }
+ 
+     @Synchronized fun observeMetered(context: Context, id: Long) {
+@@ -166,6 +177,7 @@
+             if (r.excluded) j.put("excluded", true)
+             if (r.offlineKm != null) j.put("offlineKm", r.offlineKm)
+             if (r.metered) j.put("metered", true)
++            if (r.provisional) j.put("provisional", true)
+             if (r.actualGross != null) j.put("actual",r.actualGross)
+             if (r.latencyMs != null) j.put("latencyMs",r.latencyMs)
+             if (r.fixedSurcharge != null) j.put("surcharge",r.fixedSurcharge)
+--- a/core-tests/AutoLearningCheck.kt
++++ b/core-tests/AutoLearningCheck.kt
+@@ -18,6 +18,15 @@
+             demandMultiplier = 1.0, offlineKm = km, actualKm = km * 1.05)
+     }
+     check(LearnedRates.fit(base, rows.take(4), now) == null)
++    val previewRows = rows.map { it.copy(provisional = true) }
++    check(LearnedRates.fit(base, previewRows, now) == null)
++    val withMeasuredRoute = previewRows.map { it.copy(routeKm = it.km, routeMinutes = it.minutes) }
++    check(LearnedRates.fit(base, withMeasuredRoute, now) != null)
++    check(FastRouteEstimate.between(43.24, 76.89, 43.24, 76.89) == null)
++    check(FastRouteEstimate.between(43.24, 76.89, 43.94, 76.89) == null)
++    val fast = FastRouteEstimate.between(43.24, 76.89, 43.25, 76.91)!!
++    check(fast.provisional && fast.km in 2.6..2.8 && fast.minutes == fast.km * 2)
++    check(FastRouteEstimate.SHOW_AFTER_MS < 1_000L)
+     check(LearnedRates.fit(base, rows.map { it.copy(excluded = true) }, now) == null)
+     val fit = LearnedRates.fit(base, rows, now)!!
+     for ((km, minutes) in listOf(2.0 to 9.0, 6.0 to 18.0, 12.0 to 25.0)) {
