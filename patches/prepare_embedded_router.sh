@@ -22,7 +22,7 @@ jar --create --file "$project/app/libs/brouter-1.7.10.jar" -C "$work/classes" .
 
 data="$project/app/src/main/assets/brouter"
 cp "$work/src/LICENSE" "$data/LICENSE-BRouter.txt"
-cp "$work/src/misc/profiles2/"{car-vario.brf,car-shortest-znay-v45.brf,lookups.dat} "$data/"
+cp "$work/src/misc/profiles2/"{car-vario.brf,car-balanced-znay-v46.brf,lookups.dat} "$data/"
 if [[ -z "$segment" ]]; then
     segment="$work/E75_N40.rd5"
     curl --fail --silent --show-error --location --retry 3 --max-time 180 \
