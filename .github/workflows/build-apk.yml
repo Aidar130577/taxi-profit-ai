@@ -111,6 +111,7 @@ jobs:
           patch --batch -p1 < ../patches/calculator-v33.patch
           patch --batch -p1 < ../patches/calculator-v34.patch
           patch --batch -p1 < ../patches/calculator-v35.patch
+          patch --batch -p1 < ../patches/calculator-v36.patch
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -132,7 +133,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 35').replace('0.17.0-approved-overlays', '0.35.0-first-quote-latency'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 36').replace('0.17.0-approved-overlays', '0.36.0-accessibility-stability'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -181,7 +182,7 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='35'" apk-badging.txt
+          grep -q "versionCode='36'" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
@@ -189,11 +190,11 @@ jobs:
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
-          cp "$APK" ZnayTsenu-v35.apk
+          cp "$APK" ZnayTsenu-v36.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v35-branded-apk
-          path: ZnayTsenu-v35.apk
+          name: ZnayTsenu-v36-branded-apk
+          path: ZnayTsenu-v36.apk
           retention-days: 7
           if-no-files-found: error
 
@@ -210,7 +211,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ZnayTsenu-v35-branded-apk
+          name: ZnayTsenu-v36-branded-apk
       - name: Enable hardware virtualization
         run: sudo chmod 666 /dev/kvm
       - name: Test service and calculator overlay
@@ -220,4 +221,4 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v35.apk
+          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v36.apk

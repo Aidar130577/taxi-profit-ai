@@ -92,7 +92,7 @@ adb shell run-as "$package" sh -c \
 <map>
     <boolean name="shift_active" value="true" />
     <boolean name="ocr_choice" value="true" />
-    <boolean name="ocr_allowed" value="false" />
+    <boolean name="ocr_allowed" value="true" />
 </map>
 XML
 adb shell am start -W -n "$activity"
@@ -104,6 +104,23 @@ wait_for_log "First offer quote drawn"
 latency=$(adb logcat -d -s "$log_tag:V" | sed -n 's/.*First offer quote drawn in \([0-9][0-9]*\)ms.*/\1/p' | head -n1)
 test "$latency" -le 4000
 echo "Native test order rendered in ${latency}ms from first detection on Android API $api"
+
+if (( api >= 34 )); then
+    main_pid=$(adb shell pidof "$package" | tr -d '\r')
+    worker_pid=""
+    for attempt in {1..25}; do
+        worker_pid=$(adb shell pidof "$package:ocr" | tr -d '\r' || true)
+        if [[ -n "$worker_pid" ]]; then break; fi
+        sleep 1
+    done
+    test -n "$worker_pid"
+    test "$worker_pid" != "$main_pid"
+    adb shell run-as "$package" kill -9 "$worker_pid"
+    sleep 2
+    test "$(adb shell pidof "$package" | tr -d '\r')" = "$main_pid"
+    adb shell dumpsys accessibility | grep 'Bound services:' | grep 'Знай цену' >/dev/null
+    echo "Accessibility remained bound after OCR process was terminated on API $api"
+fi
 
 adb shell settings put secure accessibility_enabled 0
 adb shell settings delete secure enabled_accessibility_services

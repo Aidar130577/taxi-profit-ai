@@ -1,0 +1,426 @@
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -15,6 +15,7 @@
+             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+         </activity>
+         <service android:name=".RideGpsService" android:exported="false" android:foregroundServiceType="location"/>
++        <service android:name=".OcrWorkerService" android:exported="false" android:process=":ocr"/>
+         <service android:name=".RadarAccessibilityService" android:exported="true" android:label="@string/accessibility_service_name" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+             <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+             <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_service_config"/>
+--- a/app/src/main/java/kz/taxiprofitai/MainActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/MainActivity.kt
+@@ -179,15 +179,18 @@
+     private fun openServiceSettings() {
+         val allowed = accessibilityAllowed()
+         val connected = RadarAccessibilityService.connected
+-        val diagnostic = prefs.getString(RadarAccessibilityService.DIAGNOSTIC, null)
++        val diagnostic = listOfNotNull(
++            prefs.getString(RadarAccessibilityService.DIAGNOSTIC, null),
++            if (allowed && !connected) ServiceExitDiagnostics.summary(this) else null
++        ).joinToString("\n")
+         val message = when {
+             connected -> "Служба уже подключена. Вернитесь в приложение и включите калькулятор."
+-            allowed -> "Переключатель включён, но Android ещё не подключил службу. В «Скачанных приложениях» выключите «Знай цену» и включите снова."
++            allowed -> "Разрешение сохранено. Android пока не подключил службу чтения заказов."
+             else -> "Откройте «Скачанные приложения» → «Знай цену — чтение карточки заказа» и включите основной переключатель. Затем вернитесь и включите калькулятор."
+         }
+         android.app.AlertDialog.Builder(this)
+             .setTitle(if (allowed && !connected) "Служба не подключилась" else "Чтение карточки заказа")
+-            .setMessage(if (diagnostic != null) "$message\n\n$diagnostic" else message)
++            .setMessage(if (diagnostic.isNotBlank()) "$message\n\n$diagnostic" else message)
+             .setNegativeButton("Закрыть", null)
+             .setPositiveButton("Открыть настройки"){ _, _ ->
+                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/OcrClient.kt
+@@ -0,0 +1,131 @@
++package kz.taxiprofitai
++
++import android.content.ComponentName
++import android.content.Context
++import android.content.Intent
++import android.content.ServiceConnection
++import android.hardware.HardwareBuffer
++import android.os.Bundle
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++import android.os.Message
++import android.os.Messenger
++import android.os.RemoteException
++import android.os.SystemClock
++
++/** All client methods and callbacks run on the main thread. Frames stay in memory. */
++class OcrClient(context: Context) {
++    private val app = context.applicationContext
++    private val handler = Handler(Looper.getMainLooper())
++    private data class Request(
++        val data: Bundle,
++        var buffer: HardwareBuffer?,
++        val ready: (WindowOcr.Reading) -> Unit,
++        val done: (WindowOcr.Reading?) -> Unit,
++        val timeout: Runnable
++    )
++    private val pending = linkedMapOf<Int, Request>()
++    private var nextId = 0
++    private var worker: Messenger? = null
++    private var bound = false
++    private var closed = false
++    private var retryAfter = 0L
++    private val reply = Messenger(Handler(Looper.getMainLooper()) { message ->
++        if (message.what == OcrProtocol.RESULT) {
++            val id = message.arg1
++            val request = pending[id]
++            if (request != null) {
++                val result = OcrProtocol.decode(message.data)
++                if (message.arg2 == 1) finish(id, result) else result?.let(request.ready)
++            }
++        }
++        true
++    })
++    private val connection = object : ServiceConnection {
++        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
++            if (closed || !bound || binder == null) return
++            worker = Messenger(binder)
++            try {
++                worker?.send(Message.obtain(null, OcrProtocol.PREPARE))
++                for ((id, request) in pending.toMap()) dispatch(id, request)
++            } catch (_: RemoteException) { unavailable() }
++        }
++
++        override fun onServiceDisconnected(name: ComponentName?) = unavailable()
++        override fun onBindingDied(name: ComponentName?) = unavailable()
++        override fun onNullBinding(name: ComponentName?) = unavailable()
++    }
++
++    fun prepare() {
++        if (closed || bound || SystemClock.elapsedRealtime() < retryAfter) return
++        bound = runCatching {
++            app.bindService(Intent(app, OcrWorkerService::class.java), connection, Context.BIND_AUTO_CREATE)
++        }.getOrDefault(false)
++        if (!bound) unavailable()
++    }
++
++    fun recognize(
++        buffer: HardwareBuffer, colorSpace: Int, badgeOnly: Boolean, progress: Boolean,
++        ready: (WindowOcr.Reading) -> Unit, done: (WindowOcr.Reading?) -> Unit
++    ) {
++        prepare()
++        if (closed || !bound) {
++            buffer.close()
++            done(null)
++            return
++        }
++        val id = ++nextId
++        val timeout = Runnable { finish(id, null) }
++        val data = Bundle().apply {
++            putInt("colorSpace", colorSpace)
++            putBoolean("badgeOnly", badgeOnly)
++            putBoolean("progress", progress)
++        }
++        val request = Request(data, buffer, ready, done, timeout)
++        pending[id] = request
++        handler.postDelayed(timeout, 4_200L)
++        try { dispatch(id, request) } catch (_: RemoteException) { unavailable() }
++    }
++
++    private fun dispatch(id: Int, request: Request) {
++        val peer = worker ?: return
++        val frame = request.buffer ?: return
++        val message = Message.obtain(null, OcrProtocol.READ, id, 0)
++        message.replyTo = reply
++        message.data = Bundle(request.data).apply { putParcelable("buffer", frame) }
++        try {
++            peer.send(message)
++        } finally {
++            request.buffer = null
++            frame.close()
++        }
++    }
++
++    private fun finish(id: Int, result: WindowOcr.Reading?) {
++        val request = pending.remove(id) ?: return
++        handler.removeCallbacks(request.timeout)
++        request.buffer?.close()
++        request.done(result)
++    }
++
++    private fun unavailable() {
++        retryAfter = SystemClock.elapsedRealtime() + 30_000L
++        release()
++    }
++
++    private fun release() {
++        worker = null
++        if (bound) {
++            bound = false
++            runCatching { app.unbindService(connection) }
++        }
++        pending.keys.toList().forEach { finish(it, null) }
++    }
++
++    fun close() {
++        if (closed) return
++        closed = true
++        release()
++    }
++}
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/OcrWorkerService.kt
+@@ -0,0 +1,104 @@
++package kz.taxiprofitai
++
++import android.app.Service
++import android.content.Intent
++import android.graphics.ColorSpace
++import android.hardware.HardwareBuffer
++import android.os.Bundle
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++import android.os.Message
++import android.os.Messenger
++import android.os.RemoteException
++
++/** Tesseract lives outside the Android accessibility service's process. */
++class OcrWorkerService : Service() {
++    private val incoming by lazy { WindowOcr(this) }
++    private val progress by lazy { WindowOcr(this, "ocr-progress-v1") }
++    private val messenger = Messenger(Handler(Looper.getMainLooper()) { message ->
++        when (message.what) {
++            OcrProtocol.PREPARE -> incoming.prepare()
++            OcrProtocol.READ -> read(message)
++        }
++        true
++    })
++
++    @Suppress("DEPRECATION")
++    private fun read(message: Message) {
++        val data = message.data
++        val buffer = data.getParcelable<HardwareBuffer>("buffer")
++        val reply = message.replyTo
++        if (reply == null || buffer == null) {
++            buffer?.close()
++            if (reply != null) sendReply(reply, message.arg1, null, true)
++            return
++        }
++        val space = ColorSpace.Named.values().map(ColorSpace::get)
++            .firstOrNull { it.id == data.getInt("colorSpace") } ?: ColorSpace.get(ColorSpace.Named.SRGB)
++        val isProgress = data.getBoolean("progress")
++        val worker = if (isProgress) progress else incoming
++        val request = message.arg1
++        worker.recognize(buffer, space, data.getBoolean("badgeOnly"), isProgress,
++            ready = { sendReply(reply, request, it, false) },
++            done = { sendReply(reply, request, it, true) })
++    }
++
++    private fun sendReply(reply: Messenger, id: Int, reading: WindowOcr.Reading?, done: Boolean) {
++        val message = Message.obtain(null, OcrProtocol.RESULT, id, if (done) 1 else 0)
++        message.data = OcrProtocol.encode(reading)
++        try { reply.send(message) } catch (_: RemoteException) {}
++    }
++
++    override fun onBind(intent: Intent?): IBinder = messenger.binder
++
++    override fun onDestroy() {
++        incoming.close()
++        progress.close()
++        super.onDestroy()
++    }
++}
++
++internal object OcrProtocol {
++    const val PREPARE = 1
++    const val READ = 2
++    const val RESULT = 3
++
++    fun encode(reading: WindowOcr.Reading?) = Bundle().apply {
++        if (reading == null) return@apply
++        putBoolean("reading", true)
++        putString("text", reading.text)
++        if (reading.purple != null) putLong("purple", reading.purple)
++        putBoolean("cardOnly", reading.cardOnly)
++        putBadge("badge", reading.badge)
++        reading.progress?.let {
++            putBoolean("progress", true)
++            putBoolean("selecting", it.selecting)
++            putBadge("route", it.route)
++            if (it.gross != null) putDouble("gross", it.gross)
++            putString("destination", it.destination)
++            putString("tariff", it.tariff)
++        }
++    }
++
++    fun decode(data: Bundle): WindowOcr.Reading? {
++        if (!data.getBoolean("reading")) return null
++        val progress = if (data.getBoolean("progress")) {
++            TripProgress(data.getBoolean("selecting"), data.badge("route"),
++                data.getDouble("gross").takeIf { data.containsKey("gross") },
++                data.getString("destination"), data.getString("tariff"))
++        } else null
++        return WindowOcr.Reading(data.getString("text"), data.getLong("purple").takeIf { data.containsKey("purple") },
++            data.getBoolean("cardOnly"), data.badge("badge"), progress)
++    }
++
++    private fun Bundle.putBadge(key: String, value: TripBadge?) {
++        if (value != null) {
++            putDouble("${key}Km", value.km)
++            putInt("${key}Minutes", value.minutes)
++        }
++    }
++
++    private fun Bundle.badge(key: String): TripBadge? =
++        if (containsKey("${key}Km")) TripBadge(getDouble("${key}Km"), getInt("${key}Minutes")) else null
++}
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -33,8 +33,7 @@
+     private var routeStatus: String = ""
+ 
+     private lateinit var windows: WindowManager
+-    private var ocr: WindowOcr?=null
+-    private var progressOcr: WindowOcr?=null
++    private var ocr: OcrClient?=null
+     private var progressOcrBusy = false
+     private var lastProgressOcr = 0L
+     private var offerStartedAt: Long? = null
+@@ -84,7 +83,11 @@
+     private var running=false
+     private val settingsListener=android.content.SharedPreferences.OnSharedPreferenceChangeListener { _,key ->
+         if (key == "shift_active") {
+-            if (prefs.getBoolean("shift_active", false)) startShift() else stopShift()
++            try {
++                if (prefs.getBoolean("shift_active", false)) startShift() else stopShift()
++            } catch (e: Exception) {
++                recordFailure("Запуск калькулятора", e)
++            }
+         }
+     }
+     override fun onServiceConnected() {
+@@ -128,7 +131,7 @@
+         // Wait for the system to finish binding the service and assigning its overlay token.
+         scheduleScan(200L)
+         if (android.os.Build.VERSION.SDK_INT >= 34 && prefs.getBoolean("ocr_allowed", false)) {
+-            WindowOcr(this).also { ocr = it }.prepare()
++            OcrClient(this).also { ocr = it }.prepare()
+         }
+     }
+ 
+@@ -143,8 +146,6 @@
+         scanGeneration++
+         ocr?.close()
+         ocr = null
+-        progressOcr?.close()
+-        progressOcr = null
+         progressOcrBusy = false
+         lastProgressOcr = 0L
+         ocrBusy = false
+@@ -380,17 +381,16 @@
+         original:OrderTextParser.Detected, badgeOnly:Boolean, progressOnly:Boolean = false
+     ){
+         if(android.os.Build.VERSION.SDK_INT<34 || !prefs.getBoolean("ocr_allowed",false))return
+-        val worker = if (progressOnly) {
++        if (progressOnly) {
+             if (progressOcrBusy || now - lastProgressOcr < 1800L) return
+             progressOcrBusy = true
+             lastProgressOcr = now
+-            progressOcr ?: WindowOcr(this, "ocr-progress-v1").also { progressOcr = it }
+         } else {
+             if (ocrBusy || now - lastOcr < 700L) return
+             ocrBusy = true
+             lastOcr = now
+-            ocr ?: WindowOcr(this).also { ocr = it }
+-        }
++        }
++        val worker = ocr ?: OcrClient(this).also { ocr = it }
+         fun finished() {
+             if (progressOnly) progressOcrBusy = false else ocrBusy = false
+         }
+@@ -465,7 +465,7 @@
+             takeScreenshotOfWindow(windowId, mainExecutor, object : TakeScreenshotCallback {
+                 override fun onSuccess(result: ScreenshotResult) {
+                     if (!running || epoch != ocrEpoch) { result.hardwareBuffer.close(); return }
+-                    worker.recognize(result, badgeOnly, progressOnly,
++                    worker.recognize(result.hardwareBuffer, result.colorSpace.id, badgeOnly, progressOnly,
+                         ready = { publish(it, false) }, done = { publish(it, true) })
+                 }
+                 override fun onFailure(errorCode: Int) { if (epoch == ocrEpoch) finished() }
+@@ -645,7 +645,9 @@
+     private fun disconnect() {
+         connected = false
+         prefs.unregisterOnSharedPreferenceChangeListener(settingsListener)
+-        if (running) stopShift()
++        if (running) {
++            try { stopShift() } catch (e: Exception) { recordFailure("Остановка службы", e) }
++        }
+     }
+ 
+     override fun onUnbind(intent: Intent?): Boolean {
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/ServiceExitDiagnostics.kt
+@@ -0,0 +1,30 @@
++package kz.taxiprofitai
++
++import android.app.ActivityManager
++import android.app.ApplicationExitInfo
++import android.content.Context
++import android.os.Build
++
++object ServiceExitDiagnostics {
++    fun summary(context: Context): String? {
++        if (Build.VERSION.SDK_INT < 30) return null
++        return runCatching {
++            val app = context.packageName
++            val started = System.currentTimeMillis() - 24 * 60 * 60_000L
++            val manager = context.getSystemService(ActivityManager::class.java) ?: return null
++            manager.getHistoricalProcessExitReasons(app, 0, 12)
++                .firstOrNull { it.processName == app && it.timestamp >= started }
++                ?.let { record ->
++                    val label = when (record.reason) {
++                        ApplicationExitInfo.REASON_CRASH -> "необработанная ошибка приложения"
++                        ApplicationExitInfo.REASON_CRASH_NATIVE -> "сбой нативного кода"
++                        ApplicationExitInfo.REASON_ANR -> "приложение не отвечало"
++                        ApplicationExitInfo.REASON_LOW_MEMORY -> "нехватка памяти"
++                        ApplicationExitInfo.REASON_USER_REQUESTED -> "процесс закрыт по запросу системы или пользователя"
++                        else -> "завершение процесса"
++                    }
++                    "Системная диагностика · $label · код ${record.reason}"
++                }
++        }.getOrNull()
++    }
++}
+--- a/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
++++ b/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
+@@ -1,8 +1,9 @@
+ package kz.taxiprofitai
+ 
+-import android.accessibilityservice.AccessibilityService
+ import android.content.Context
+ import android.graphics.Bitmap
++import android.graphics.ColorSpace
++import android.hardware.HardwareBuffer
+ import com.googlecode.tesseract.android.TessBaseAPI
+ import java.io.File
+ import java.util.concurrent.Executors
+@@ -43,10 +44,9 @@
+     }
+ 
+     fun recognize(
+-        result: AccessibilityService.ScreenshotResult, badgeOnly: Boolean, progressOnly: Boolean,
++        buffer: HardwareBuffer, colorSpace: ColorSpace, badgeOnly: Boolean, progressOnly: Boolean,
+         ready: (Reading) -> Unit, done: (Reading?) -> Unit
+     ){
+-        val buffer=result.hardwareBuffer
+         if(closed){buffer.close();done(null);return}
+         try{
+             worker.execute {
+@@ -59,7 +59,7 @@
+                 var progress: TripProgress? = null
+                 try{
+                     if(!closed){
+-                        hw=Bitmap.wrapHardwareBuffer(buffer,result.colorSpace)
++                        hw=Bitmap.wrapHardwareBuffer(buffer,colorSpace)
+                         bitmap=hw?.copy(Bitmap.Config.ARGB_8888,false)
+                         if(bitmap!=null && !closed){
+                             if (progressOnly) progress = readProgress(bitmap, engine(badgeOnly = true))
