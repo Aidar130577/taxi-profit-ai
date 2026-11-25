@@ -115,13 +115,29 @@ assert count == 1, "Expected original tariff title mapping"
 s, count = re.subn(r'(text\(c,title,[^,\n]+,[^,\n]+,)\d+(?:\.\d+)?f', r'\g<1>22f', s)
 assert count == 1, "Expected one tariff header draw call"
 
-# Manual contrast theme. Read the saved setting on each draw, so changing
-# it takes effect on the next render without changing the system theme.
+# Night mode retains slate. Day mode uses pale cyan and saturated dark
+# lettering for high contrast (bright yellow/green would wash out on it).
 anchor = "        paint.color = Color.rgb(22, 32, 39)"
 assert s.count(anchor) == 1
-s = s.replace(anchor, """        val nightMap = context.getSharedPreferences("taxi_profit_settings", android.content.Context.MODE_PRIVATE)
+# Only the drawing method is themed; never modify pricing or accessibility data.
+a = s.index("    override fun onDraw(c:Canvas){")
+b = s.index("    fun showQuote(", a)
+draw = s[a:b]
+draw = draw.replace("Color.WHITE", "panelInk")
+draw = re.sub(r'\byellow\b', 'panelGold', draw)
+draw = re.sub(r'\bgreen\b', 'panelGreen', draw)
+draw = re.sub(r'\bpurple\b', 'panelPurple', draw)
+draw = draw.replace(anchor, """        val nightMap = context.getSharedPreferences("taxi_profit_settings", android.content.Context.MODE_PRIVATE)
             .getBoolean("overlay_night_map", true)
-        paint.color = if (nightMap) Color.rgb(72, 86, 99) else Color.rgb(22, 32, 39)""")
+        val panelInk = if (nightMap) Color.WHITE else Color.rgb(8, 34, 78)
+        val panelGold = if (nightMap) yellow else Color.rgb(151, 72, 0)
+        val panelGreen = if (nightMap) green else Color.rgb(0, 104, 49)
+        val panelPurple = if (nightMap) Color.rgb(221, 184, 255) else Color.rgb(112, 0, 190)
+        paint.color = if (nightMap) Color.rgb(72, 86, 99) else Color.rgb(186, 242, 255)""")
+# Keep the yellow outline in night mode and use vivid blue in daylight.
+draw = draw.replace("        paint.color = panelGold\n        c.drawRoundRect", "        paint.color = if (nightMap) yellow else Color.rgb(0, 83, 212)\n        c.drawRoundRect")
+s = s[:a] + draw + s[b:]
+
 p.write_text(s)
 
 p = root / "RadarAccessibilityService.kt"
@@ -144,4 +160,4 @@ s = s.replace(anchor, '''        val nightMapButton = action(if (prefs.getBoolea
         root.addView(nightMapButton)
 ''' + anchor)
 p.write_text(s)
-print("Compact overlay: 144dp x 57.6dp; night-map slate / day-map dark; persistent manual toggle.")
+print("Compact overlay: 144dp x 57.6dp; night-map slate / day-map pale cyan; persistent manual toggle.")
