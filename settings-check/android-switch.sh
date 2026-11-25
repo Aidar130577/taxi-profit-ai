@@ -7,8 +7,17 @@ package=kz.taxiprofitai
 service="$package/$package.RadarAccessibilityService"
 
 capture_settings() {
-    adb shell uiautomator dump /sdcard/znay-system-settings.xml >/dev/null
-    adb pull /sdcard/znay-system-settings.xml "$temp_dir/settings.xml" >/dev/null
+    local remote=/sdcard/znay-system-settings.xml
+    for attempt in {1..6}; do
+        adb shell rm -f "$remote"
+        adb shell uiautomator dump "$remote" >/dev/null 2>&1 || true
+        if adb shell test -s "$remote" && adb pull "$remote" "$temp_dir/settings.xml" >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    adb shell dumpsys activity activities | grep -E 'ResumedActivity|topResumedActivity' || true
+    return 1
 }
 
 find_target() {
@@ -51,6 +60,7 @@ tap_target() {
     xy=$(find_target "$@") || return 1
     read -r x y <<< "$xy"
     adb shell input tap "$x" "$y"
+    sleep 1
 }
 
 adb install "$1"
@@ -66,9 +76,9 @@ for attempt in {1..5}; do
     adb shell input swipe "$((width / 2))" "$((height * 4 / 5))" "$((width / 2))" "$((height / 3))" 280
 done
 capture_settings
-tap_target 'class=android.widget.Switch' 'prefix=Use Знай цену' || { show_labels; exit 1; }
+tap_target 'prefix=Use Знай цену' 'class=android.widget.Switch' 'class=android.widget.CompoundButton' || { show_labels; exit 1; }
 capture_settings
-tap_target 'text=Allow' 'text=Yes' 'text=OK' || { show_labels; exit 1; }
+tap_target 'text=Allow' 'text=Yes' 'text=OK' 'text=Start now' || { show_labels; exit 1; }
 
 for attempt in {1..20}; do
     enabled=$(adb shell settings get secure enabled_accessibility_services)
