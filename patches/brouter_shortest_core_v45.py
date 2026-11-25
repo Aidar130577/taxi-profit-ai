@@ -19,7 +19,7 @@ replace(path,"    cost += distanceCost;\n\n    return cost;",
     // OsmPath still enforces forbidden ways, turn restrictions and destination access.
     if (km.shortestDistance) {
       if (cf >= 9999.f || distanceCost < 0.) return -1.;
-      return dist * Math.max(1.f, cf) + 0.5f;
+      return streetTimeCost(km, cf, dist, cosangle, isStartpoint, nsection, lastpriorityclassifier);
     }
     return cost;""")
 # In the search phase (no detail message), do not evaluate vehicle dynamics on
@@ -28,11 +28,31 @@ replace(path, "    double cost = 0.;\n    double extraTime = 0.;",
     """    if (km.shortestDistance && message == null) {
       float cf = rc.expctxWay.getCostfactor();
       if (cf >= 9999.f || km.getWayMaxspeed() <= 0.f) return -1.;
-      return dist * Math.max(1.f, cf) + 0.5f;
+      return streetTimeCost(km, cf, dist, cosangle, isStartpoint, nsection, lastpriorityclassifier);
     }
 
     double cost = 0.;
     double extraTime = 0.;""")
+# Single cheap objective for both A* and guided retrace:
+# road-weighted physical distance + estimated driving-time cost.
+# ETA output still uses the original kinematic integration on the chosen path.
+replace(path, "  protected double evolveDistance(KinematicModel km, double dist, double delta_h, double f_air) {",
+    """  private double streetTimeCost(KinematicModel km, float cf, double dist,
+                                double cosangle, boolean isStartpoint, int nsection,
+                                int lastpriorityclassifier) {
+    double speed = km.getEffectiveSpeedLimit();
+    if (speed <= 0. || !Double.isFinite(speed)) return -1.;
+    double turnSeconds = isStartpoint ? 0. : 6. * (1. - cosangle);
+    if (!isStartpoint && nsection == 0 &&
+        ((lastpriorityclassifier < 20) ^ (priorityclassifier < 20))) {
+      turnSeconds += 10.;
+    }
+    // 12 equivalent metres per estimated second; starting calibration only.
+    // Nonnegative time cost and distance coefficient >= 1 preserve A* lower bound.
+    return dist * Math.max(1.f, cf) + 12. * (dist / speed + turnSeconds) + 0.5f;
+  }
+
+  protected double evolveDistance(KinematicModel km, double dist, double delta_h, double f_air) {""")
 # Skip construction of crossing/turn slowdown hints during the distance-only
 # search; leave the regular link loading and detailed ETA pass intact.
 engine=root/"brouter-core/src/main/java/btools/router/RoutingEngine.java"
