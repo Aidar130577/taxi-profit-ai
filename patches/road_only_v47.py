@@ -49,18 +49,18 @@ p = root / "OfferPopupView.kt"
 s = p.read_text()
 a = s.index("    private val logicalHeight get() = ")
 b = s.index("\n", a)
-s = s[:a] + "    private val logicalHeight get() = if (waiting) 38 else if (hasQuote) 82 else 104" + s[b:]
+s = s[:a] + "    private val logicalHeight get() = if (waiting) 38 else if (hasQuote) 96 else 116" + s[b:]
 a = s.index("        line(c,78f)")
 b = s.index("        c.restore()", a)
 s = s[:a] + """        // Show a short explanation only while a usable fare is unavailable.
         if (!hasQuote) {
-            line(c,78f)
-            text(c,footer,120f,96f,14f,Color.WHITE,false,Paint.Align.CENTER,228f)
+            line(c,92f)
+            text(c,footer,120f,108f,14f,Color.WHITE,false,Paint.Align.CENTER,228f)
         }
 """ + s[b:]
 # Width is specified in the window and also in the view's measurement.
 assert s.count("(240 * density).toInt()") == 1
-s = s.replace("(240 * density).toInt()", "(152 * density).toInt()")
+s = s.replace("(240 * density).toInt()", "(144 * density).toInt()")
 assert "if (logicalHeight != oldHeight) requestLayout()" in s
 assert s.index("hasQuote = estimate != null") < s.index("if (logicalHeight != oldHeight) requestLayout()")
 # Two equal columns: Yandex gross and take-home amount.
@@ -69,9 +69,9 @@ b = s.index("        // Show a short explanation", a)
 s = s[:a] + """        line(c,29f)
         paint.color = Color.WHITE
         paint.strokeWidth = 1f
-        c.drawLine(120f, 34f, 120f, 76f, paint)
-        text(c,"яндекс",60f,46f,16f,yellow,true,Paint.Align.CENTER,110f)
-        text(c,"на руки",180f,46f,16f,green,true,Paint.Align.CENTER,110f)
+        c.drawLine(120f, 34f, 120f, 90f, paint)
+        text(c,"яндекс",60f,50f,16f,yellow,true,Paint.Align.CENTER,110f)
+        text(c,"на руки",180f,50f,16f,green,true,Paint.Align.CENTER,110f)
         // Fit both amounts to the same full column width, with 3 logical
         // pixels of clearance on each side. Keep the same font height.
         fun amount(value: String, center: Float, color: Int) {
@@ -82,7 +82,7 @@ s = s[:a] + """        line(c,29f)
             val measured = compactAmountPaint.measureText(clean)
             if (measured > 0f && measured.isFinite()) {
                 compactAmountPaint.textScaleX = 114f / measured
-                c.drawText(clean, center, 70f, compactAmountPaint)
+                c.drawText(clean, center, 82f, compactAmountPaint)
             }
             compactAmountPaint.textScaleX = 1f
         }
@@ -113,9 +113,9 @@ p.write_text(s)
 p = root / "RadarAccessibilityService.kt"
 s = p.read_text()
 assert s.count("minOf(dp(240), screenWidth())") == 1
-s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(152), screenWidth())")
+s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(144), screenWidth())")
 p.write_text(s)
-print("Compact overlay: 152dp wide, 51.9dp fare height, 24.1dp waiting height; status only for missing fare.")
+print("Compact overlay: 144dp wide, 57.6dp fare height, 22.8dp waiting height; status only for missing fare.")
 , '''        title = "Тариф " + when (tariff.trim().uppercase(java.util.Locale.ROOT)) {
             "EK", "ЕК", "ECONOMY", "ЭКОНОМ" -> "EK"
             "K", "К", "COMFORT", "КОМФОРТ" -> "K"
@@ -136,6 +136,6 @@ p.write_text(s)
 p = root / "RadarAccessibilityService.kt"
 s = p.read_text()
 assert s.count("minOf(dp(240), screenWidth())") == 1
-s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(152), screenWidth())")
+s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(144), screenWidth())")
 p.write_text(s)
 print("Compact overlay: 152dp wide, 51.9dp fare height, 24.1dp waiting height; status only for missing fare.")
