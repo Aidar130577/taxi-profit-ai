@@ -128,6 +128,7 @@ jobs:
           python3 ../patches/route_diagnostics_v45.py
           python3 ../patches/shortest_route_v45.py
           python3 ../patches/road_only_v47.py
+          python3 ../patches/dual_fare_v47.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -179,7 +180,7 @@ jobs:
         working-directory: android-project
         run: |
           command -v kotlinc
-          kotlinc app/src/main/java/kz/taxiprofitai/Engine.kt app/src/main/java/kz/taxiprofitai/CommissionCatalog.kt app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/OfferPopupState.kt core-tests/OfferDemandCheck.kt core-tests/OfferPopupCheck.kt app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt app/src/main/java/kz/taxiprofitai/NetQuotePresentation.kt app/src/main/java/kz/taxiprofitai/PlaceLookup.kt app/src/main/java/kz/taxiprofitai/AlmatyLookupKey.kt core-tests/LocalFareLearningCheck.kt app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt core-tests/RideTimeCheck.kt app/src/main/java/kz/taxiprofitai/TripBadge.kt core-tests/TripBadgeCheck.kt app/src/main/java/kz/taxiprofitai/TripProgress.kt core-tests/TripProgressCheck.kt app/src/main/java/kz/taxiprofitai/TripReceipt.kt app/src/main/java/kz/taxiprofitai/LearnedRates.kt core-tests/AutoLearningCheck.kt -include-runtime -d /tmp/offer-demand.jar
+          kotlinc app/src/main/java/kz/taxiprofitai/Engine.kt app/src/main/java/kz/taxiprofitai/CommissionCatalog.kt app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/OfferPopupState.kt core-tests/OfferDemandCheck.kt core-tests/OfferPopupCheck.kt app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt app/src/main/java/kz/taxiprofitai/NetQuotePresentation.kt app/src/main/java/kz/taxiprofitai/PlaceLookup.kt app/src/main/java/kz/taxiprofitai/AlmatyLookupKey.kt core-tests/LocalFareLearningCheck.kt app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt core-tests/RideTimeCheck.kt app/src/main/java/kz/taxiprofitai/TripBadge.kt core-tests/TripBadgeCheck.kt app/src/main/java/kz/taxiprofitai/TripProgress.kt core-tests/TripProgressCheck.kt app/src/main/java/kz/taxiprofitai/TripReceipt.kt app/src/main/java/kz/taxiprofitai/LearnedRates.kt app/src/main/java/kz/taxiprofitai/DualFareMean.kt core-tests/AutoLearningCheck.kt -include-runtime -d /tmp/offer-demand.jar
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.OfferDemandCheckKt
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.OfferPopupCheckKt
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.LocalFareLearningCheckKt
