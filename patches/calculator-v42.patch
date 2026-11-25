@@ -1,0 +1,306 @@
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -9,8 +9,8 @@
+         versionCode = 17
+         versionName = "0.17.0-approved-overlays"
+     }
+-    buildFeatures { aidl = true }
++    androidResources { noCompress += "rd5" }
+     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+     kotlinOptions { jvmTarget = "17" }
+ }
+-dependencies { implementation("cz.adaptech.tesseract4android:tesseract4android:4.9.0"); implementation("org.maplibre.gl:android-sdk:11.8.0") }
++dependencies { implementation(files("libs/brouter-1.7.10.jar")); implementation("cz.adaptech.tesseract4android:tesseract4android:4.9.0"); implementation("org.maplibre.gl:android-sdk:11.8.0") }
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -5,8 +5,6 @@
+     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+-    <!-- Android 11+ package visibility: query only the optional open-source BRouter package. -->
+-    <queries><package android:name="btools.routingapp"/></queries>
+     <application android:allowBackup="false" android:label="@string/app_name" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:supportsRtl="true">
+         <activity android:name=".BenchmarkActivity" android:exported="false"/>
+         <activity android:name=".RouteTestActivity" android:exported="false"/>
+--- a/app/src/main/aidl/btools/routingapp/IBRouterService.aidl
++++ /dev/null
+@@ -1,7 +0,0 @@
+-package btools.routingapp;
+-
+-// Public BRouter external-service AIDL contract, abrensch/brouter, MIT.
+-// Keep exactly the same package and method signature for IPC compatibility.
+-interface IBRouterService {
+-    String getTrackFromParams(in Bundle params);
+-}
+--- a/app/src/main/java/kz/taxiprofitai/BRouterConnector.kt
++++ b/app/src/main/java/kz/taxiprofitai/BRouterConnector.kt
+@@ -1,89 +1,68 @@
+ package kz.taxiprofitai
+ 
+-import android.content.ComponentName
+ import android.content.Context
+-import android.content.Intent
+-import android.content.ServiceConnection
+-import android.os.Bundle
+ import android.os.Handler
+-import android.os.IBinder
+ import android.os.Looper
+-import btools.routingapp.IBRouterService
+-import java.util.ArrayDeque
++import java.io.File
+ import java.util.concurrent.Executors
+ 
+-/** Uses the documented public Android bound service of the separately installed BRouter app.
+- * No HTTP calls, subscriptions or Yandex/KazKef private interfaces.
+- * Must be configured in BRouter with downloaded .rd5 map segments and motorcar_fast profile.
+- */
++/** Extracts the bundled tile once and runs road routing on a dedicated worker. */
+ class BRouterConnector(private val context: Context) {
+     data class Point(val lat: Double, val lon: Double) {
+         init { require(lat in -90.0..90.0 && lon in -180.0..180.0) }
+     }
+-    private data class Request(val a: Point, val b: Point, val callback: (Result<OfflineRoute>) -> Unit)
++
+     private val ui = Handler(Looper.getMainLooper())
+     private val worker = Executors.newSingleThreadExecutor()
+-    private val queue = ArrayDeque<Request>()
+-    private var router: IBRouterService? = null
+-    private var bound = false
++    private var router: EmbeddedRoadRouter? = null
++    private var warming = false
+     private var closed = false
+-    private val connection = object: ServiceConnection {
+-        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+-            router = IBRouterService.Stub.asInterface(binder)
+-            drain()
+-        }
+-        override fun onServiceDisconnected(name: ComponentName?) { router = null }
+-        override fun onBindingDied(name: ComponentName?) { detach(); failPending("Служба BRouter отключилась") }
+-        override fun onNullBinding(name: ComponentName?) { detach(); failPending("BRouter не предоставил службу") }
++
++    /** Called at shift start, before the first offer arrives. */
++    fun prepare() {
++        if (closed || warming) return
++        warming = true
++        worker.execute { runCatching { engine().warmProfile() } }
+     }
+ 
+-    /** Call from Android main thread; callback is delivered on the same thread. */
+     fun route(a: Point, b: Point, callback: (Result<OfflineRoute>) -> Unit) {
+-        if (closed) { callback(Result.failure(IllegalStateException("Маршрутизатор закрыт"))); return }
+-        queue.addLast(Request(a,b,callback))
+-        if (router != null) { drain();return }
+-        prepare()
+-        if (!bound) failPending("BRouter не установлен или его сервис недоступен")
++        if (closed) return
++        worker.execute {
++            val result = runCatching { engine().route(a.lat, a.lon, b.lat, b.lon) }
++            ui.post { if (!closed) callback(result) }
++        }
+     }
+ 
+-    fun prepare() {
+-        if (closed || bound) return
+-        val intent = Intent().setClassName("btools.routingapp", "btools.routingapp.BRouterService")
+-        bound = runCatching { context.bindService(intent, connection, Context.BIND_AUTO_CREATE) }.getOrDefault(false)
++    private fun engine(): EmbeddedRoadRouter {
++        router?.let { return it }
++        val data = synchronized(extractLock) {
++            val root = File(context.noBackupFilesDir, "offline-roads")
++            @Suppress("DEPRECATION")
++            val revision = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
++            val folder = File(root, revision.toString())
++            check(folder.isDirectory || folder.mkdirs()) { "Не удалось открыть офлайн-карту" }
++            for (name in assets) {
++                val target = File(folder, name)
++                if (target.isFile && target.length() > 0) continue
++                val partial = File(folder, "$name.part")
++                context.assets.open("brouter/$name").use { input ->
++                    partial.outputStream().use(input::copyTo)
++                }
++                check(partial.renameTo(target)) { "Не удалось сохранить офлайн-карту" }
++            }
++            root.listFiles()?.filter { it != folder }?.forEach { it.deleteRecursively() }
++            folder
++        }
++        return EmbeddedRoadRouter(data).also { router = it }
+     }
+ 
+-    private fun detach() {
+-        if (bound) runCatching { context.unbindService(connection) }
+-        bound = false
+-        router = null
+-    }
+-    private fun drain() {
+-        val service = router ?: return
+-        while (queue.isNotEmpty()) {
+-            val q = queue.removeFirst()
+-            worker.execute {
+-                val result = runCatching {
+-                    val p = Bundle().apply {
+-                        putString("lonlats", "${q.a.lon},${q.a.lat}|${q.b.lon},${q.b.lat}")
+-                        putString("v", "motorcar")
+-                        putString("fast", "1")
+-                        putString("trackFormat", "json")
+-                        putString("maxRunningTime", "12")
+-                    }
+-                    val raw = service.getTrackFromParams(p) ?: error("BRouter вернул пустой маршрут")
+-                    BRouterRouteResult.parse(raw)
+-                }
+-                ui.post { if (!closed) q.callback(result) }
+-            }
+-        }
+-    }
+-    private fun failPending(message: String) {
+-        while (queue.isNotEmpty()) queue.removeFirst().callback(Result.failure(IllegalStateException(message)))
+-    }
+     fun close() {
+-        closed=true
+-        failPending("Маршрутизатор закрыт")
+-        detach()
++        closed = true
+         worker.shutdownNow()
+     }
++
++    companion object {
++        private val extractLock = Any()
++        private val assets = listOf("car-vario.brf", "lookups.dat", "E75_N40.rd5")
++    }
+ }
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/EmbeddedRoadRouter.kt
+@@ -0,0 +1,40 @@
++package kz.taxiprofitai
++
++import btools.router.ProfileCache
++import btools.router.RoutingContext
++import btools.router.RoutingEngine
++import btools.router.RoutingParamCollector
++import java.io.File
++
++/** Uses the BRouter Java core with the bundled car profile and offline road tile. */
++internal class EmbeddedRoadRouter(private val data: File) {
++    private fun context() = RoutingContext().apply {
++        localFunction = File(data, "car-vario.brf").absolutePath
++        memoryclass = 32
++    }
++
++    fun warmProfile() {
++        val routing = context()
++        try {
++            ProfileCache.parseProfile(routing)
++        } finally {
++            ProfileCache.releaseProfile(routing)
++        }
++    }
++
++    fun route(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): OfflineRoute {
++        require(covers(fromLat, fromLon) && covers(toLat, toLon)) { "Точка вне офлайн-карты Алматы" }
++        val waypoints = RoutingParamCollector().readPositions(
++            doubleArrayOf(fromLon, toLon), doubleArrayOf(fromLat, toLat)
++        )
++        val routing = context()
++        val engine = RoutingEngine(null, null, data, waypoints, routing, RoutingEngine.BROUTER_ENGINEMODE_ROUTING)
++        engine.quite = true
++        engine.doRun(2_000)
++        val result = engine.foundTrack ?: error(engine.errorMessage ?: "Встроенный BRouter не нашёл маршрут")
++        require(result.distance >= 20 && result.totalSeconds > 0) { "Маршрут слишком короткий для расчёта" }
++        return OfflineRoute(result.distance / 1000.0, result.totalSeconds / 60.0)
++    }
++
++    private fun covers(lat: Double, lon: Double) = lat >= 40.0 && lat < 45.0 && lon >= 75.0 && lon < 80.0
++}
+--- a/app/src/main/java/kz/taxiprofitai/MainActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/MainActivity.kt
+@@ -138,7 +138,13 @@
+         root.addView(action("Данные карты © OpenStreetMap") {
+             android.app.AlertDialog.Builder(this)
+                 .setTitle("Офлайн-данные Алматы")
+-                .setMessage("© OpenStreetMap contributors, ODbL 1.0. Источник выгрузки — Geofabrik. Адреса и названия мест ищутся в индексе внутри приложения. Дороги для расчёта маршрута загружаются отдельно в BRouter.")
++                .setMessage("© OpenStreetMap contributors, ODbL 1.0. Источник выгрузки — Geofabrik. Адреса и названия мест ищутся в индексе внутри приложения. Дорожный сегмент Алматы и окрестностей включён в приложение. Движок и профиль BRouter распространяются по лицензии MIT.")
++                .setNeutralButton("Источники") { _, _ ->
++                    val notice = assets.open("brouter/DATA-NOTICE.txt").bufferedReader().use { it.readText() }
++                    val license = assets.open("brouter/LICENSE-BRouter.txt").bufferedReader().use { it.readText() }
++                    android.app.AlertDialog.Builder(this).setTitle("BRouter и дорожные данные")
++                        .setMessage("$notice\n\n$license").setPositiveButton("Закрыть", null).show()
++                }
+                 .setNegativeButton("Закрыть", null)
+                 .setPositiveButton("Лицензия"){ _, _ ->
+                     startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://www.openstreetmap.org/copyright")))
+@@ -160,25 +166,11 @@
+                 .show()
+             return
+         }
+-        fun start(){
+-            startTripGps()
+-            CityWeather.condition(this, System.currentTimeMillis())
+-            prefs.edit().putBoolean("shift_active",true).apply()
+-            updatePermission()
+-            moveTaskToBack(true)
+-        }
+-        val installed=try{
+-            packageManager.getPackageInfo("btools.routingapp",0)
+-            true
+-        }catch(e:android.content.pm.PackageManager.NameNotFoundException){false}
+-        if(installed){start();return}
+-        android.app.AlertDialog.Builder(this)
+-            .setTitle("Расчёт маршрута")
+-            .setMessage("Для расчёта стоимости поездки этой тестовой версии нужен BRouter с картой Алматы. Без BRouter приложение покажет карточку заказа, но маршрут и прогноз цены будут недоступны.")
+-            .setNegativeButton("Включить без маршрута"){_,_->start()}
+-            .setPositiveButton("Установить BRouter"){_,_->
+-                startActivity(Intent(Intent.ACTION_VIEW,android.net.Uri.parse("https://f-droid.org/packages/btools.routingapp/")))
+-            }.show()
++        startTripGps()
++        CityWeather.condition(this, System.currentTimeMillis())
++        prefs.edit().putBoolean("shift_active",true).apply()
++        updatePermission()
++        moveTaskToBack(true)
+     }
+     private fun openServiceSettings() {
+         val allowed = accessibilityAllowed()
+--- a/app/src/main/java/kz/taxiprofitai/RouteTestActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/RouteTestActivity.kt
+@@ -30,7 +30,7 @@
+         col.addView(Button(this).apply {
+             text="Проверить настоящий маршрут"
+             setOnClickListener {
+-                result.text="Ищем адреса и обращаемся к локальной службе BRouter..."
++                result.text="Ищем адреса и строим маршрут во встроенном BRouter..."
+                 val name=tariff.selectedItem.toString()
+                 val demand=extra.text.toString().replace(',','.').toDoubleOrNull()
+                 if(demand==null||demand<0) {result.text="Некорректная надбавка";return@setOnClickListener}
+@@ -46,7 +46,7 @@
+                         val pctLabel=calc.commission?.effectiveYandexPct?.let {"%.2f%%".format(java.util.Locale.US,it)}?:"неизвестна"
+                         result.text="BRouter: %.2f км / %.1f мин\nПрогноз стоимости: %s\nКомиссия Яндекса для $name: $pctLabel\nПосле комиссий: %s\n\nБЕЗ живых пробок и без автоматической платной подачи.\nСтавки Яндекса и стоимость поездки требуют проверки.".format(
+                             java.util.Locale("ru","KZ"),route.km,route.minutes,FareEngine.kzt(calc.gross),netText)
+-                    },onFailure={result.text="Маршрут не получен: ${it.message}\n\nПроверь установленный BRouter, автомобильный профиль и скачанные сегменты rd5. Геокодер Android тоже может быть недоступен."})
++                    },onFailure={result.text="Маршрут не получен: ${it.message}\n\nПроверь адреса. Встроенная карта покрывает Алматы и окрестности."})
+                 }
+             }
+         })
+--- /dev/null
++++ b/core-tests/EmbeddedRouterCheck.kt
+@@ -0,0 +1,23 @@
++package kz.taxiprofitai
++
++import java.io.File
++import kotlin.system.measureTimeMillis
++
++fun main(args: Array<String>) {
++    val engine = EmbeddedRoadRouter(File(args.single()))
++    println("Profile warm-up: ${measureTimeMillis { engine.warmProfile() }} ms")
++    val routes = listOf(
++        doubleArrayOf(43.2389, 76.8897, 43.2449, 76.9063, 1.0, 4.0),
++        doubleArrayOf(43.2523, 76.9345, 43.2017, 76.8704, 8.0, 17.0),
++        doubleArrayOf(43.2246, 76.8535, 43.3509, 77.0222, 20.0, 40.0),
++    )
++    for (row in routes) {
++        val latency = measureTimeMillis {
++            val result = engine.route(row[0], row[1], row[2], row[3])
++            check(!result.provisional && result.km in row[4]..row[5] && result.minutes > 0) { result }
++            print("${result.km} km / ${result.minutes} min: ")
++        }
++        println("$latency ms")
++    }
++    check(runCatching { engine.route(51.1, 71.4, 51.2, 71.5) }.isFailure)
++}
