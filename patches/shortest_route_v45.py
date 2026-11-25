@@ -26,7 +26,9 @@ edit(p,'listOf("car-vario.brf", "lookups.dat", "E75_N40.rd5")','listOf("car-vari
 # Tests compare both objectives on the same actual map and endpoints.
 p=Path("core-tests/EmbeddedRouterCheck.kt")
 edit(p,'            check(result.geometry.size >= 2)',
-'''            val previous = engine.route(row[0], row[1], row[2], row[3], shortest = false)
+'''            val started = System.nanoTime()
+            val previous = engine.route(row[0], row[1], row[2], row[3], shortest = false)
+            println("Previous profile: " + (System.nanoTime() - started)/1_000_000 + " ms")
             check(result.km <= previous.km + 0.05) {
                 "Distance objective is longer: " + result.km + " vs " + previous.km
             }
