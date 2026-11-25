@@ -1,6 +1,8 @@
 name: Build Taxi Profit AI Android APK
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
   push:
     branches: [main, fix/v43-stability]
     paths:
@@ -119,6 +121,7 @@ jobs:
           patch --batch -p1 < ../patches/calculator-v41.patch
           patch --batch -p1 < ../patches/calculator-v42.patch
           python3 ../patches/stability_v43.py
+          python3 ../patches/road_packs_v43.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -187,7 +190,7 @@ jobs:
           bash patches/prepare_embedded_router.sh android-project
           cd android-project
           EMBEDDED=app/libs/brouter-1.7.10.jar
-          kotlinc -classpath "$EMBEDDED" app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/EmbeddedRoadRouter.kt core-tests/EmbeddedRouterCheck.kt -include-runtime -d /tmp/embedded-router.jar
+          kotlinc -classpath "$EMBEDDED" app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/EmbeddedRoadRouter.kt app/src/main/java/kz/taxiprofitai/KazakhstanRoadTiles.kt core-tests/EmbeddedRouterCheck.kt -include-runtime -d /tmp/embedded-router.jar
           java -cp "/tmp/embedded-router.jar:$EMBEDDED" kz.taxiprofitai.EmbeddedRouterCheckKt app/src/main/assets/brouter
       - name: Assemble test APK
         working-directory: android-project
