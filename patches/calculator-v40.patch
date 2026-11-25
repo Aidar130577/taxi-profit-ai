@@ -1,0 +1,1171 @@
+--- a/app/src/main/java/kz/taxiprofitai/Engine.kt
++++ b/app/src/main/java/kz/taxiprofitai/Engine.kt
+@@ -147,7 +147,7 @@
+                         val pickup: String?, val destination: String?, val pickupKm: Double?, val pickupMin: Int?,
+                         val verifiedHighDemandDiscount: Boolean = false, val displayedGross: Double? = null,
+                         val pickupExtra: Long? = null, val observedCoefficient: Double? = null,
+-                        val tripBadge: TripBadge? = null)
++                        val tripBadge: TripBadge? = null, val trialId: Long? = null)
+     private val fixed = Regex("\\+\\s*(\\d[\\d\\s]*)\\s*[₸Т](?!\\w)", RegexOption.IGNORE_CASE)
+     private val mult = Regex("[×xх]\\s*(\\d+[,.]\\d+)", RegexOption.IGNORE_CASE)
+     private val pickup = Regex("""(?iu)(\d+(?:[,.]\d+)?)\s*(км|м)\s*[·•.\-]\s*(\d+)\s*мин""")
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/LearnedPlaces.kt
+@@ -0,0 +1,60 @@
++package kz.taxiprofitai
++
++import android.content.Context
++import org.json.JSONObject
++import java.security.MessageDigest
++
++/** Device-local lookup for addresses previously missing from the offline index. */
++object LearnedPlaces {
++    private const val FILE = "learned_city_points"
++    private const val MAX_ENTRIES = 600
++
++    private fun key(raw: String): String? {
++        val text = PlaceLookup.streetAddress(raw) ?: raw
++        val address = !PlaceLookup.isNamedPlace(text)
++        val normalized = AlmatyLookupKey.candidates(text, address).lastOrNull() ?: return null
++        return MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray(Charsets.UTF_8))
++            .joinToString("") { "%02x".format(it) }
++    }
++
++    @Synchronized fun remember(context: Context, raw: String, point: BRouterConnector.Point, verified: Boolean) {
++        if (point.lat !in 42.5..44.5 || point.lon !in 75.0..79.0) return
++        val key = key(raw) ?: return
++        val prefs = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++        val entries = prefs.all
++        val old = entries[key]?.let(::decode)
++        val nearby = old != null && kotlin.math.abs(old.point.lat - point.lat) < 0.00033 &&
++            kotlin.math.abs(old.point.lon - point.lon) < 0.00045
++        val evidence = when {
++            verified -> 2
++            old != null && old.count >= 2 -> return
++            nearby -> 2
++            else -> 1
++        }
++        val data = JSONObject().put("lat", point.lat).put("lon", point.lon)
++            .put("count", evidence).put("date", System.currentTimeMillis())
++        val editor = prefs.edit().putString(key, data.toString())
++        if (old == null && entries.size >= MAX_ENTRIES) {
++            entries.minByOrNull { decode(it.value)?.date ?: 0 }?.let { editor.remove(it.key) }
++        }
++        editor.apply()
++    }
++
++    @Synchronized fun find(context: Context, raw: String): BRouterConnector.Point? {
++        val key = key(raw) ?: return null
++        return decode(context.getSharedPreferences(FILE, Context.MODE_PRIVATE).getString(key, null))
++            ?.takeIf { it.count >= 2 }?.point
++    }
++
++    @Synchronized fun points(context: Context): List<BRouterConnector.Point> =
++        context.getSharedPreferences(FILE, Context.MODE_PRIVATE).all.values
++            .mapNotNull(::decode).filter { it.count >= 2 }.map { it.point }.distinct()
++
++    private data class Entry(val point: BRouterConnector.Point, val count: Int, val date: Long)
++
++    private fun decode(value: Any?): Entry? = if (value !is String) null else runCatching {
++        val json = JSONObject(value)
++        Entry(BRouterConnector.Point(json.getDouble("lat"), json.getDouble("lon")),
++            json.getInt("count"), json.getLong("date"))
++    }.getOrNull()
++}
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/LearnedRates.kt
+@@ -0,0 +1,88 @@
++package kz.taxiprofitai
++
++import kotlin.math.abs
++
++/** Fits effective prices to previously observed trips, with a chronological holdout. */
++object LearnedRates {
++    data class Profile(val rate: TariffRate, val trips: Int, val adjustments: List<Double>) {
++        fun rateFor(km: Double) = rate.copy(start = rate.start + adjustments[distanceBand(km)])
++    }
++
++    private data class Sample(val km: Double, val minutes: Double, val base: Double, val time: Long)
++    private fun distanceBand(km: Double) = when {
++        km < 4.0 -> 0
++        km < 10.0 -> 1
++        else -> 2
++    }
++
++    fun fit(rate: TariffRate, rows: List<LocalTrial>, now: Long): Profile? {
++        val samples = rows.asSequence().filter {
++            !it.excluded && it.tariff == rate.title && it.tariffRevision == TarifCatalog.lastVerified &&
++                it.createdAtMs in (now - 45L * 86_400_000)..now && it.actualGross != null &&
++                it.fixedSurcharge != null && it.demandMultiplier != null
++        }.mapNotNull { row ->
++            val metered = row.metered
++            val km = if (metered) row.actualKm else row.routeKm ?: row.km
++            val minutes = if (metered) row.actualMinutes else row.routeMinutes ?: row.minutes
++            val gross = row.actualGross!!
++            val fixed = row.fixedSurcharge!!
++            val multiplier = row.demandMultiplier!!
++            if (km == null || minutes == null || km !in 0.05..300.0 || minutes !in 0.5..240.0 ||
++                !gross.isFinite() || fixed !in 0.0..99_900.0 || multiplier !in 1.0..20.0) return@mapNotNull null
++            val base = (gross - fixed) / multiplier
++            Sample(km, minutes, base, row.createdAtMs).takeIf { base in 100.0..100_000.0 }
++        }.sortedBy { it.time }.toList()
++        if (samples.size < 16) return null
++        val checkSize = maxOf(5, samples.size / 4)
++        val training = samples.dropLast(checkSize)
++        val validation = samples.takeLast(checkSize)
++        val fitted = coefficients(rate, training)
++        val bands = (0..2).map { band ->
++            val train = training.filter { distanceBand(it.km) == band }
++            val test = validation.filter { distanceBand(it.km) == band }
++            if (train.size < 5 || test.size < 2) return@map 0.0
++            val residuals = train.map { it.base - predict(fitted, it) }.sorted()
++            val offset = (residuals[(residuals.size - 1) / 2] + residuals[residuals.size / 2]) / 2
++            val limited = offset.coerceIn(-rate.start * 0.35, rate.start * 0.35)
++            if (relativeError(test) { predict(fitted, it) + limited } <
++                relativeError(test) { predict(fitted, it) } * 0.95) limited else 0.0
++        }
++        val initial = relativeError(validation) { predict(rate, it) }
++        val improved = relativeError(validation) { predict(fitted, it) + bands[distanceBand(it.km)] }
++        if (initial <= 0.0 || improved > initial * 0.95) return null
++        return Profile(fitted, samples.size, bands)
++    }
++
++    private fun predict(rate: TariffRate, sample: Sample) = FareEngine.base(rate, RouteEstimate(sample.km, sample.minutes))
++
++    private fun relativeError(rows: List<Sample>, prediction: (Sample) -> Double) =
++        rows.map { abs(prediction(it) - it.base) / it.base }.average()
++
++    private fun coefficients(rate: TariffRate, samples: List<Sample>): TariffRate {
++        val reference = doubleArrayOf(rate.start, rate.perKm, rate.perMinute)
++        val fitted = reference.copyOf()
++        fun features(row: Sample) = doubleArrayOf(1.0, (row.km - rate.includedKm).coerceAtLeast(0.0),
++            (row.minutes - rate.includedMinutes).coerceAtLeast(0.0))
++        val inputs = samples.map { row -> features(row) to row.base }
++        val distinctKm = samples.maxOf { it.km } - samples.minOf { it.km }
++        val distinctMinutes = samples.maxOf { it.minutes } - samples.minOf { it.minutes }
++        repeat(32) {
++            for (i in reference.indices) {
++                if (i == 1 && distinctKm < 3.0 || i == 2 && distinctMinutes < 9.0) continue
++                // Keep minutes and kilometres close to their priors when the samples are correlated.
++                val scale = reference[i].coerceAtLeast(1.0)
++                val shrink = 0.12 / (scale * scale)
++                var square = shrink
++                var target = shrink * reference[i]
++                for ((x, gross) in inputs) {
++                    val other = fitted.indices.filter { it != i }.sumOf { fitted[it] * x[it] }
++                    val weight = 1.0 / (gross * gross)
++                    square += weight * x[i] * x[i]
++                    target += weight * x[i] * (gross - other)
++                }
++                fitted[i] = (target / square).coerceIn(reference[i] * 0.45, reference[i] * 1.65)
++            }
++        }
++        return rate.copy(start = fitted[0], perKm = fitted[1], perMinute = fitted[2])
++    }
++}
+--- a/app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt
++++ b/app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt
+@@ -20,7 +20,16 @@
+     val offlineMinutes: Double? = null,
+     val actualMinutes: Double? = null,
+     val actualKm: Double? = null,
+-    val weather: RideWeather = RideWeather.UNKNOWN
++    val weather: RideWeather = RideWeather.UNKNOWN,
++    val hasForecast: Boolean = true,
++    val routeKm: Double? = null,
++    val routeMinutes: Double? = null,
++    val demandMultiplier: Double? = null,
++    val priceSource: FareFactSource? = null,
++    val receiptId: String? = null,
++    val excluded: Boolean = false,
++    val offlineKm: Double? = null,
++    val metered: Boolean = false
+ )
+ 
+ /** Adapts the v4 temporal validation to one driver's confirmed trips. */
+--- a/app/src/main/java/kz/taxiprofitai/MainActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/MainActivity.kt
+@@ -127,7 +127,11 @@
+         }
+         root.addView(stop)
+         root.addView(action("История прогнозов"){ showLearningHistory() })
++        root.addView(action("Ставки по поездкам"){ showLearnedRates() })
+         root.addView(action("GPS и погода"){ showTripSensors() })
++        root.addView(action("Карта сохранённых точек") {
++            startActivity(android.content.Intent(this, SimpleMapActivity::class.java))
++        })
+         if (android.os.Build.VERSION.SDK_INT >= 34) {
+             root.addView(action("Распознавание адресов"){ showOcrSettings() })
+         }
+@@ -251,7 +255,7 @@
+                 } else if (index == 0) {
+                     android.app.AlertDialog.Builder(this)
+                         .setTitle("GPS поездок")
+-                        .setMessage("Во время поездки GPS измеряет расстояние. В истории остаются только километры и время. Координаты не сохраняются и не отправляются.")
++                        .setMessage("Во время поездки GPS измеряет расстояние. Точки посадки и высадки с точным GPS помогают узнавать новые адреса. Эти точки сохраняются только на телефоне.")
+                         .setNegativeButton("Отмена", null)
+                         .setPositiveButton("Разрешить") { _, _ ->
+                             requestPermissions(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION,
+@@ -286,13 +290,33 @@
+         }
+     }
+ 
++    private fun showLearnedRates() {
++        val rows = TrialStore.read(this)
++        val now = System.currentTimeMillis()
++        val message = TarifCatalog.rates.joinToString("\n\n") { rate ->
++            val profile = LearnedRates.fit(rate, rows, now)
++            val count = rows.count { it.tariff == rate.title && it.actualGross != null && !it.excluded }
++            if (profile == null) "${rate.title} · поездок с ценой: $count\nИдёт проверка данных"
++            else {
++                val km = "%.1f".format(profile.rate.perKm)
++                val minute = "%.1f".format(profile.rate.perMinute)
++                "${rate.title} · ${profile.trips} поездок\n$km ₸/км · $minute ₸/мин сверх включённых в старт"
++            }
++        }
++        android.app.AlertDialog.Builder(this)
++            .setTitle("Ставки калькулятора")
++            .setMessage("Оценки по вашим поездкам.\n\n$message")
++            .setNegativeButton("Закрыть", null)
++            .show()
++    }
++
+     private fun showLearningHistory() {
+         val rows = TrialStore.read(this)
+         val dialog = android.app.AlertDialog.Builder(this)
+             .setTitle("История прогнозов")
+             .setNegativeButton("Закрыть", null)
+         if (rows.isEmpty()) {
+-            dialog.setMessage("Здесь будут прогнозы и фактическое время поездок. Время можно добавить вручную, если приложение не увидело начало или завершение.")
++            dialog.setMessage("Здесь появятся прогнозы, считанные цены Яндекс Про и измеренные параметры поездок.")
+         } else {
+             val format = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
+             val labels = rows.map { row ->
+@@ -300,9 +324,18 @@
+                     val speed = (row.actualKm ?: row.km) * 60 / minutes
+                     val mark = if (row.actualKm == null) "≈" else ""
+                     "${"%.1f".format(minutes)} мин · $mark${"%.0f".format(speed)} км/ч"
+-                } ?: "Добавить факт"
+-                val gross = row.actualGross?.let { "Факт ${FareEngine.kzt(it)}" } ?: ""
+-                "${format.format(java.util.Date(row.createdAtMs))} · ${row.tariff}\nПрогноз ${FareEngine.kzt(row.forecastGross)} · $actual $gross".trimEnd()
++                }
++                val gross = row.actualGross?.let {
++                    val source = if (row.priceSource == FareFactSource.MANUAL) "Введено вручную" else "Яндекс Про"
++                    "$source ${FareEngine.kzt(it)}"
++                }
++                val forecast = if (row.hasForecast) "Прогноз ${FareEngine.kzt(row.forecastGross)}" else "Прогноз отсутствовал"
++                val error = row.actualGross?.takeIf { row.hasForecast && !row.excluded }?.let {
++                    val pct = (row.forecastGross - it) * 100 / it
++                    "Ошибка ${"%+.1f".format(pct)}%"
++                }
++                val details = listOfNotNull(forecast, gross, error, actual).joinToString(" · ")
++                "${format.format(java.util.Date(row.createdAtMs))} · ${row.tariff}\n$details"
+             }.toTypedArray()
+             dialog.setItems(labels) { _, index -> confirmTrip(rows[index]) }
+         }
+--- a/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
+@@ -8,9 +8,7 @@
+ import java.util.concurrent.CompletableFuture
+ import java.util.concurrent.Executors
+ 
+-/** Address -> coordinates -> BRouter, without storing passenger addresses or contacting proprietary APIs.
+- * The OS geocoder may require network / return no results. This is surfaced, not hidden.
+- */
++/** Resolve city points using the offline index, learned local points, and the Android geocoder. */
+ class OfflineRoutePipeline(context: Context) {
+     private val appContext = context.applicationContext
+     private val ui = Handler(Looper.getMainLooper())
+@@ -21,7 +19,7 @@
+         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String,BRouterConnector.Point>?): Boolean = size > 32
+     }
+     @Volatile private var closed = false
+-    // Short-lived in-memory cache only; never persist passenger addresses/coordinates.
++    // Entire routes stay in the short-lived in-memory cache.
+     private val routeCache = object: LinkedHashMap<String,Pair<Long,OfflineRoute>>(20,0.75f,true) {
+         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String,Pair<Long,OfflineRoute>>?): Boolean = size > 20
+     }
+@@ -82,7 +80,7 @@
+         // Explicit coordinates are helpful for a completely offline routing test, without any geocoder.
+         val match=Regex("^\\s*(4[23]\\.\\d{3,}),\\s*(7[567]\\.\\d{3,})\\s*$").find(norm)
+         val found=if(match!=null) BRouterConnector.Point(match.groupValues[1].toDouble(),match.groupValues[2].toDouble())
+-        else offlineAlmaty.find(raw) ?: run {
++        else offlineAlmaty.find(raw) ?: LearnedPlaces.find(appContext, raw) ?: run {
+             @Suppress("DEPRECATION")
+             val geocoder=Geocoder(appContext,Locale("ru","KZ"))
+             val queries = PlaceLookup.queries(raw)
+@@ -97,14 +95,34 @@
+                             listOfNotNull(address.featureName, address.premises, address.getAddressLine(0)))
+                     }
+             }.map { matches ->
+-                if (named) PlaceLookup.namedMatch(queries.last(), matches) else matches.firstOrNull()
++                if (named) PlaceLookup.namedMatch(queries.last(), matches)
++                else {
++                    val exact = matches.filter { candidate -> candidate.labels.any { label ->
++                        val address = label.split(',').take(2).joinToString(",").trim()
++                        OrderTextParser.samePoint(raw, address)
++                    } }
++                    exact.singleOrNull()?.also {
++                        LearnedPlaces.remember(appContext, raw, BRouterConnector.Point(it.lat, it.lon), verified = true)
++                    } ?: matches.firstOrNull()
++                }
+             }.firstOrNull { it != null }
+                 ?: error(if (named) "Место не найдено однозначно" else "Не удалось найти адрес: $raw")
+-            BRouterConnector.Point(found.lat, found.lon)
++            BRouterConnector.Point(found.lat, found.lon).also {
++                if (named) LearnedPlaces.remember(appContext, raw, it, verified = true)
++            }
+         }
+         synchronized(pointCache) { pointCache[norm]=found }
+         return found
+     }
++    fun observeEndpoint(address: String, point: BRouterConnector.Point) {
++        if (closed) return
++        geocodeWorker.execute {
++            if (!closed && runCatching { offlineAlmaty.find(address) == null }.getOrDefault(false)) {
++                LearnedPlaces.remember(appContext, address, point, verified = false)
++            }
++        }
++    }
++
+     fun close() {
+         closed = true
+         pendingRoutes.clear()
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -55,6 +55,10 @@
+     private var lastScan = 0L
+     private var routeGeneration = 0L
+     private val rideTiming = RideTiming()
++    private var trackedRide: OrderTextParser.Detected? = null
++    private var lastCompletedTrial: Pair<Long, Long>? = null
++    private var meteredTrial: Long? = null
++    private var storedFixed: Pair<Long, TripBadge?>? = null
+     private val tripProgress = TripProgressState()
+     private var progressEpoch = 0L
+     private var loggedOffer = false
+@@ -147,6 +151,10 @@
+     private fun stopShift() {
+         running = false
+         rideTiming.reset()
++        trackedRide = null
++        lastCompletedTrial = null
++        meteredTrial = null
++        storedFixed = null
+         tripProgress.clear()
+         acceptedFare.clear()
+         ui.removeCallbacks(acceptedFareTimeout)
+@@ -344,13 +352,36 @@
+         }
+         walk(root, 0)
+         val visible = texts.distinct().joinToString("\n")
+-        val (ridePhase, destinations) = OrderTextParser.rideObservation(visible)
++        val (observedPhase, destinations) = OrderTextParser.rideObservation(visible)
++        val receipt = if (lastCompletedTrial != null || trackedRide != null) TripReceipt.read(visible) else null
++        val receiptEndsRide = receipt != null && observedPhase == RidePhase.OTHER && receipt.minutes != null &&
++            receipt.tariff == trackedRide?.tariff && rideTiming.matchesElapsed(receipt.minutes, lastScan)
++        val ridePhase = if (receiptEndsRide) RidePhase.COMPLETED else observedPhase
+         rideTiming.observe(ridePhase, destinations, lastScan)?.let { fact ->
+             TrialStore.saveActual(this, fact.rowId, minutes = fact.minutes,
+                 km = RideGpsService.distanceKm(fact.minutes), automatic = true)
+         }
++        if (ridePhase == RidePhase.COMPLETED) {
++            trackedRide?.let { completed ->
++                completed.trialId?.let { lastCompletedTrial = it to lastScan }
++                completed.pickup?.let { address ->
++                    RideGpsService.endpoint(start = true)?.let { routePipeline?.observeEndpoint(address, it) }
++                }
++                completed.destination?.let { address ->
++                    RideGpsService.endpoint(start = false)?.let { routePipeline?.observeEndpoint(address, it) }
++                }
++            }
++        }
++        if (receipt != null) {
++            val id = lastCompletedTrial?.takeIf { lastScan - it.second in 0L..90_000L }?.first
++            if (id != null && TrialStore.observeReceipt(this, id, receipt)) lastCompletedTrial = null
++        }
+         RideGpsService.record(rideTiming.active)
+         if (ridePhase == RidePhase.CANCELLED || ridePhase == RidePhase.COMPLETED) {
++            if (ridePhase == RidePhase.CANCELLED) trackedRide?.trialId?.let { TrialStore.exclude(this, it) }
++            trackedRide = null
++            meteredTrial = null
++            storedFixed = null
+             tripProgress.finishActive()
+             acceptedFare.clear()
+             ui.removeCallbacks(acceptedFareTimeout)
+@@ -377,6 +408,11 @@
+         val identity = OfferPopupState.identity(current.pickup, current.destination, current.tariff)
+         if (latestBadge?.first != identity) latestBadge = null
+         val newer = current.copy(tripBadge = native.tripBadge ?: current.tripBadge ?: latestBadge?.second)
++        if (newer.order && acceptedFare.allowsIncoming(identity, newer.destination) &&
++            ridePhase != RidePhase.COMPLETED && ridePhase != RidePhase.CANCELLED && phase != null && phase.destination != null && !phase.selecting) {
++            // The active trip can expose its price underneath the incoming card. Record it without switching the overlay.
++            handleTripProgress(phase, show = false)
++        }
+         if (!newer.order || !acceptedFare.allowsIncoming(identity, newer.destination)) {
+             if (phase != null && ridePhase != RidePhase.COMPLETED && ridePhase != RidePhase.CANCELLED) {
+                 handleTripProgress(phase)
+@@ -442,7 +478,7 @@
+                 if (progressOnly) {
+                     if (progressGeneration == progressEpoch && currentNativeOffer?.order != true &&
+                         (currentNativeText == visible || TripProgressReader.read(currentNativeText) != null)) {
+-                        reading.progress?.let(::handleTripProgress)
++                        reading.progress?.let { handleTripProgress(it) }
+                     }
+                     return@post
+                 }
+@@ -513,12 +549,33 @@
+         } else acceptedFare.accept(identity, destination)
+     }
+ 
+-    private fun handleTripProgress(progress: TripProgress) {
+-        val quote = tripProgress.update(progress, System.currentTimeMillis())
+-        if (quote == null) return
++    private fun handleTripProgress(progress: TripProgress, show: Boolean = true) {
++        var quote = tripProgress.update(progress, System.currentTimeMillis()) ?: return
++        if (!progress.selecting && quote.destination != null && quote.tariff != null) {
++            val now = System.currentTimeMillis()
++            val tariff = quote.tariff ?: return
++            val id = quote.trialId ?: TrialStore.observedRide(this, tariff, CityWeather.condition(this, now),
++                knownSurcharge(quote), knownMultiplier(quote)).also(tripProgress::attachTrial)
++            quote = quote.copy(trialId = id)
++            val destination = quote.destination ?: return
++            if (trackedRide?.trialId != id) lastCompletedTrial = null
++            trackedRide = quote
++            rideTiming.startVerified(id, destination, android.os.SystemClock.elapsedRealtime())
++            RideGpsService.record(rideTiming.active)
++            if (progress.metered && meteredTrial != id) {
++                meteredTrial = id
++                TrialStore.observeMetered(this, id)
++            } else if (meteredTrial != id && progress.gross != null &&
++                (storedFixed?.first != id || storedFixed?.second == null && quote.tripBadge != null)) {
++                TrialStore.observeFixed(this, id, progress.gross, quote.tripBadge)
++                storedFixed = id to quote.tripBadge
++            }
++        }
++        if (!show) return
+         val identity = OfferPopupState.identity(quote.pickup, quote.destination, quote.tariff)
+         beginAccepted(identity, quote.destination)
+-        if (progress.selecting || progress.gross == null) return
++        if (progress.selecting || progress.metered || quote.trialId == meteredTrial && meteredTrial != null ||
++            progress.gross == null) return
+         if (!acceptedFare.showOnce(android.os.SystemClock.elapsedRealtime())) return
+         processDetection(quote, false, rememberIncoming = false)
+         Log.i("ZnayTsenuService", "Accepted fare opened once")
+@@ -537,7 +594,10 @@
+             if (rememberIncoming) {
+                 ui.removeCallbacks(acceptedFareTimeout)
+                 val now = System.currentTimeMillis()
+-                tripProgress.remember(newer, now)
++                tripProgress.remember(newer.copy(trialId = detected.trialId.takeIf {
++                    OfferPopupState.identity(detected.pickup, detected.destination, detected.tariff) ==
++                        OfferPopupState.identity(newer.pickup, newer.destination, newer.tariff)
++                }), now)
+                 progressEpoch++
+             }
+             nonOrderSnapshots=0
+@@ -557,7 +617,10 @@
+                 loggedOffer = false
+             }
+             offerPopupState.observe(true, identity)
+-            detected=newer
++            detected = newer.copy(trialId = detected.trialId.takeIf {
++                rememberIncoming && identity != null &&
++                    identity == OfferPopupState.identity(detected.pickup, detected.destination, detected.tariff)
++            } ?: newer.trialId)
+             // Trigger once per unique visible order; do not re-geocode on each accessibility event.
+             val key="${newer.pickup}|${newer.destination}|${newer.tariff}|${newer.demand}|${newer.displayedGross}|${newer.tripBadge}|${newer.pickupExtra}|${newer.verifiedHighDemandDiscount}|${newer.tariff?.let{CommissionSettings.percent(prefs,it)}}|${CommissionSettings.loyalty(prefs)}|${CommissionSettings.park(prefs)}"
+             if(key!=routeKey){
+@@ -578,18 +641,20 @@
+                 } else if (newer.tripBadge != null && rate != null) {
+                     val route = newer.tripBadge.route()
+                     val demand = newer.demand ?: Demand(DemandType.NONE)
+-                    estimate = RouteFareEstimator.calculateWithCommission(rate, route, demand, yandex, park,
++                    val now = System.currentTimeMillis()
++                    val weather = CityWeather.condition(this, now)
++                    val profile = learnedProfile(rate, TrialStore.read(this), now)
++                    val effective = profile?.rateFor(route.km) ?: rate
++                    val quote = RouteFareEstimator.calculateWithCommission(effective, route, demand, yandex, park,
+                         loyalty, newer.verifiedHighDemandDiscount, pickupExtras(newer))
+-                    routeStatus = if (newer.demand == null) "Надбавка неизвестна" else route.source
+-                    val quote = estimate
+-                    val destination = newer.destination
+-                    if (!loggedOffer && quote != null && identity != null && destination != null) {
+-                        val elapsed = android.os.SystemClock.elapsedRealtime()
+-                        val rowId = TrialStore.append(this, rate.title, quote, route.source, 0,
+-                            offlineMinutes = 0.0)
+-                        rideTiming.offer(rowId, destination, elapsed)
+-                        loggedOffer = true
++                    estimate = quote
++                    routeStatus = when {
++                        newer.demand == null -> "Надбавка неизвестна"
++                        profile != null -> "Учтён опыт поездок"
++                        else -> route.source
+                     }
++                    if (rememberIncoming && identity != null) logForecast(newer, rate, quote, 0.0, weather, route.source,
++                        android.os.SystemClock.elapsedRealtime() - (offerStartedAt ?: android.os.SystemClock.elapsedRealtime()))
+                 } else if (newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank() || rate == null) {
+                     routeStatus = when {
+                         newer.pickup == null && newer.destination == null -> "Не считаны адреса А и Б"
+@@ -609,48 +674,25 @@
+                             val history = TrialStore.read(this)
+                             val now = System.currentTimeMillis()
+                             val weather = CityWeather.condition(this, now)
+-                            val minutes = RideTimeLearning.estimate(route, history, now, weather)
+-                            val timedRoute = route.copy(minutes = minutes)
++                            val km = RideTimeLearning.distance(route.km, history, now)
++                            val adjustedRoute = route.copy(km = km)
++                            val minutes = RideTimeLearning.estimate(adjustedRoute, history, now, weather)
++                            val timedRoute = adjustedRoute.copy(minutes = minutes)
+                             val timeAdjusted = kotlin.math.abs(minutes - route.minutes) >= 0.01
++                            val profile = learnedProfile(rate, history, now)
++                            val effective = profile?.rateFor(timedRoute.km) ?: rate
+                             val raw = runCatching {
+-                                RouteFareEstimator.calculateWithCommission(rate, timedRoute, demand, yandex, park,
++                                RouteFareEstimator.calculateWithCommission(effective, timedRoute, demand, yandex, park,
+                                     loyalty, newer.verifiedHighDemandDiscount,
+                                     pickupExtras(newer))
+                             }.getOrNull()
+-                            val fixed = if (newer.pickupExtra != null) null else when (observedDemand?.type) {
+-                                DemandType.NONE -> 0.0
+-                                DemandType.FIXED_ADD -> observedDemand.amount.takeIf { observedDemand.verified }
+-                                else -> null
+-                            }
+-                            val factor = if (raw != null && fixed != null && !timeAdjusted) LocalFareLearning.correction(
+-                                history, rate.title, TarifCatalog.lastVerified, raw.km, raw.minutes,
+-                                fixed, TrialStore.cityDay()
+-                            ) else 1.0
+                             estimate = raw
+-                            if (raw != null && !loggedOffer) {
+-                                val label = when {
+-                                    fixed == null -> "Надбавка не подтверждена"
+-                                    fixed > 0.0 -> "+${fixed.toInt()} ₸"
+-                                    else -> "Без надбавки"
+-                                }
+-                                val elapsed = android.os.SystemClock.elapsedRealtime()
+-                                val rowId = TrialStore.append(this, rate.title, raw, label,
+-                                    elapsed - calcStartedAt, fixed, route.minutes, weather)
+-                                rideTiming.offer(rowId, newer.destination, elapsed)
+-                                loggedOffer = true
+-                            }
+-                            if (raw != null && fixed != null) {
+-                                if (factor != 1.0) {
+-                                    val gross = LocalFareLearning.apply(raw.gross, fixed, factor)
+-                                    val commission = CommissionCatalog.calculate(gross, gross - fixed, yandex,
+-                                        park, loyalty, newer.verifiedHighDemandDiscount)
+-                                    estimate = raw.copy(gross = gross, net = commission.net, commission = commission)
+-                                }
+-                            }
++                            if (raw != null) logForecast(newer, rate, raw, route.minutes, weather, raw.source,
++                                android.os.SystemClock.elapsedRealtime() - (offerStartedAt ?: calcStartedAt), route.km)
+                             routeStatus = when {
+                                 raw == null -> "Ошибка тарифной модели"
+                                 observedDemand == null -> "Надбавка неизвестна"
+-                                factor != 1.0 -> "Учтён опыт поездок"
++                                profile != null -> "Учтён опыт поездок"
+                                 timeAdjusted -> "Время скорректировано"
+                                 else -> "Офлайн BRouter • без живых пробок"
+                             }
+@@ -674,6 +716,48 @@
+             if (nonOrderSnapshots >= 2) closeOffer() else scheduleScan(450L)
+         }
+         render()
++    }
++
++    private var cachedProfiles = emptyMap<String, Pair<List<LocalTrial>, LearnedRates.Profile?>>()
++
++    private fun learnedProfile(rate: TariffRate, history: List<LocalTrial>, now: Long): LearnedRates.Profile? {
++        val cached = cachedProfiles[rate.title]
++        if (cached != null && cached.first == history) return cached.second
++        val profile = LearnedRates.fit(rate, history, now)
++        cachedProfiles = cachedProfiles + (rate.title to (history to profile))
++        return profile
++    }
++
++    private fun knownSurcharge(offer: OrderTextParser.Detected): Double? {
++        if (offer.airport || offer.pickupExtra != null) return null
++        val demand = offer.demand ?: return null
++        return when (demand.type) {
++            DemandType.FIXED_ADD -> demand.amount.takeIf { demand.verified }
++            DemandType.NONE, DemandType.MULTIPLIER -> 0.0.takeIf { demand.verified }
++            else -> null
++        }
++    }
++
++    private fun knownMultiplier(offer: OrderTextParser.Detected): Double? {
++        val demand = offer.demand ?: return null
++        return when (demand.type) {
++            DemandType.MULTIPLIER -> demand.amount.takeIf { demand.verified }
++            DemandType.NONE, DemandType.FIXED_ADD -> 1.0.takeIf { demand.verified }
++            else -> null
++        }
++    }
++
++    private fun logForecast(offer: OrderTextParser.Detected, rate: TariffRate, estimate: LiveFareEstimate,
++                            offlineMinutes: Double, weather: RideWeather, source: String, latency: Long, offlineKm: Double? = null) {
++        val destination = offer.destination ?: return
++        if (loggedOffer || !offerPopupState.shouldShow()) return
++        val id = TrialStore.append(this, rate.title, estimate, source, latency,
++            knownSurcharge(offer), offlineMinutes, weather, knownMultiplier(offer), offlineKm)
++        val linked = offer.copy(trialId = id)
++        tripProgress.remember(linked, System.currentTimeMillis())
++        detected = linked
++        rideTiming.offer(id, destination, android.os.SystemClock.elapsedRealtime())
++        loggedOffer = true
+     }
+ 
+     private fun pickupExtras(offer: OrderTextParser.Detected) = ConfirmedExtras(
+--- a/app/src/main/java/kz/taxiprofitai/RideGpsService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RideGpsService.kt
+@@ -21,6 +21,7 @@
+         private const val CHANNEL = "ride_gps"
+         private var current: RideGpsService? = null
+         fun record(active: Boolean) { current?.recordRide(active) }
++        fun endpoint(start: Boolean): BRouterConnector.Point? = current?.endpointFix(start)
+         fun distanceKm(minutes: Double): Double? = current?.measuredDistance(minutes)
+         fun stop(context: Context) { context.stopService(Intent(context, RideGpsService::class.java)) }
+     }
+@@ -28,6 +29,8 @@
+     private lateinit var locations: LocationManager
+     private var recording = false
+     private var prior: Location? = null
++    private var firstLocation: Location? = null
++    private var startedAt = 0L
+     private var firstFix = 0L
+     private var samples = 0
+     private var totalMetres = 0.0
+@@ -66,6 +69,8 @@
+             return
+         }
+         prior = null
++        firstLocation = null
++        startedAt = SystemClock.elapsedRealtimeNanos()
+         firstFix = 0L
+         totalMetres = 0.0
+         samples = 0
+@@ -86,6 +91,7 @@
+         val old = prior
+         if (old == null) {
+             firstFix = time
++            firstLocation = location
+         } else {
+             val seconds = (time - old.elapsedRealtimeNanos) / 1_000_000_000.0
+             if (seconds <= 0) return
+@@ -95,6 +101,15 @@
+         }
+         prior = location
+         samples++
++    }
++
++    private fun endpointFix(start: Boolean): BRouterConnector.Point? {
++        if (!recording) return null
++        val fix = (if (start) firstLocation else prior) ?: return null
++        val lag = if (start) fix.elapsedRealtimeNanos - startedAt
++            else SystemClock.elapsedRealtimeNanos() - fix.elapsedRealtimeNanos
++        if (lag !in 0L..8_000_000_000L || fix.accuracy > 18f || !fix.hasSpeed() || fix.speed > 2f) return null
++        return BRouterConnector.Point(fix.latitude, fix.longitude)
+     }
+ 
+     private fun measuredDistance(minutes: Double): Double? {
+--- a/app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt
++++ b/app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt
+@@ -28,10 +28,10 @@
+             val minutes = row.actualMinutes
+             val sourceMinutes = row.offlineMinutes ?: row.minutes
+             val trip = Instant.ofEpochMilli(row.createdAtMs).atZone(city)
+-            row.createdAtMs in (now - retention)..now && period(local.hour, local.minute) == period(trip.hour, trip.minute) && row.weather == weather &&
++            !row.excluded && row.createdAtMs in (now - retention)..now && period(local.hour, local.minute) == period(trip.hour, trip.minute) && row.weather == weather &&
+                 row.km in (route.km * 0.55)..(route.km * 1.8) &&
+                 (row.actualKm == null || row.actualKm in (row.km * 0.75)..(row.km * 1.25)) &&
+-                sourceMinutes > 0 && minutes != null && minutes in 2.0..240.0 &&
++                sourceMinutes > 0 && minutes != null && minutes in 0.5..240.0 &&
+                 minutes / sourceMinutes in 0.45..3.0
+         }.distinctBy { it.id }.take(50)
+         if (similar.size < 5 || similar.map {
+@@ -41,6 +41,18 @@
+         val ratios = similar.map { it.actualMinutes!! / (it.offlineMinutes ?: it.minutes) }.sorted()
+         val ratio = (ratios[(ratios.size - 1) / 2] + ratios[ratios.size / 2]) / 2
+         return (route.minutes * ratio).coerceIn(base * 0.75, base * 1.8)
++    }
++
++    fun distance(km: Double, rows: List<LocalTrial>, now: Long): Double {
++        val ratios = rows.mapNotNull { row ->
++            val planned = row.offlineKm ?: return@mapNotNull null
++            val actual = row.actualKm ?: return@mapNotNull null
++            val ratio = actual / planned
++            ratio.takeIf { !row.excluded && row.createdAtMs in (now - retention)..now &&
++                planned in (km * 0.65)..(km * 1.5) && it in 0.8..1.25 }
++        }.take(50).sorted()
++        if (ratios.size < 6) return km
++        return km * ((ratios[(ratios.size - 1) / 2] + ratios[ratios.size / 2]) / 2).coerceIn(0.9, 1.15)
+     }
+ 
+     private fun period(hour: Int, minute: Int): Int {
+@@ -60,14 +72,31 @@
+     data class Fact(val rowId: Long, val minutes: Double)
+     private data class Offer(val id: Long, val destination: String, val elapsed: Long)
+     private var offer: Offer? = null
++    private var queued: Offer? = null
+     private var readyAt: Long? = null
+     private var startAt: Long? = null
+     val active get() = startAt != null
+ 
+     fun offer(id: Long, destination: String, elapsed: Long) {
+-        if (offer?.id == id || startAt != null) return
++        if (offer?.id == id || queued?.id == id) return
++        if (startAt != null) {
++            queued = Offer(id, destination, elapsed)
++            return
++        }
+         reset()
+         offer = Offer(id, destination, elapsed)
++    }
++
++    fun matchesElapsed(minutes: Double, elapsed: Long): Boolean {
++        val started = startAt ?: return false
++        return kotlin.math.abs((elapsed - started) / 60_000.0 - minutes) <= maxOf(1.0, minutes * 0.15)
++    }
++
++    fun startVerified(id: Long, destination: String, elapsed: Long) {
++        if (offer?.id == id && startAt != null) return
++        if (startAt != null) return
++        if (offer?.id != id) offer(id, destination, elapsed)
++        startAt = elapsed
+     }
+ 
+     fun observe(phase: RidePhase, destinations: List<String>, elapsed: Long): Fact? {
+@@ -75,29 +104,36 @@
+         val matches = destinations.any { OrderTextParser.samePoint(current.destination, it) }
+         when (phase) {
+             RidePhase.READY -> {
+-                if (startAt != null) reset()
+-                else if (matches && elapsed - current.elapsed in 0L..1_800_000L) readyAt = elapsed
++                if (startAt != null) return null
++                if (matches && elapsed - current.elapsed in 0L..1_800_000L) readyAt = elapsed
+                 else readyAt = null
+             }
+             RidePhase.ACTIVE -> {
+                 val ready = readyAt
+                 if (startAt == null && ready != null && matches && elapsed - ready in 0L..30_000L) {
+                     startAt = elapsed
+-                } else if (startAt != null && destinations.isNotEmpty() && !matches) reset()
++                }
+             }
+             RidePhase.COMPLETED -> {
+                 val minutes = startAt?.let { (elapsed - it) / 60_000.0 }
+-                reset()
+-                return minutes?.takeIf { it in 2.0..240.0 }?.let { Fact(current.id, it) }
++                finish()
++                return minutes?.takeIf { it in 0.5..240.0 }?.let { Fact(current.id, it) }
+             }
+-            RidePhase.CANCELLED -> reset()
++            RidePhase.CANCELLED -> finish()
+             RidePhase.OTHER -> Unit
+         }
+         return null
+     }
+ 
++    private fun finish() {
++        val next = queued
++        reset()
++        offer = next
++    }
++
+     fun reset() {
+         offer = null
++        queued = null
+         readyAt = null
+         startAt = null
+     }
+--- a/app/src/main/java/kz/taxiprofitai/SimpleMapActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/SimpleMapActivity.kt
+@@ -12,6 +12,7 @@
+ import android.widget.LinearLayout
+ import android.widget.TextView
+ import org.maplibre.android.MapLibre
++import org.maplibre.android.annotations.MarkerOptions
+ import org.maplibre.android.camera.CameraPosition
+ import org.maplibre.android.geometry.LatLng
+ import org.maplibre.android.maps.MapView
+@@ -39,7 +40,12 @@
+                 .target(LatLng(43.2389, 76.8897)).zoom(11.5).tilt(0.0).build()
+             map.uiSettings.isTiltGesturesEnabled = false
+             map.uiSettings.isRotateGesturesEnabled = false
+-            map.setStyle(Style.Builder().fromJson(text))
++            map.setStyle(Style.Builder().fromJson(text)) {
++                map.clear()
++                LearnedPlaces.points(this).forEach { point ->
++                    map.addMarker(MarkerOptions().position(LatLng(point.lat, point.lon)))
++                }
++            }
+         }
+     }
+     override fun onCreate(savedInstanceState: Bundle?) {
+@@ -58,11 +64,11 @@
+             background = panel(Color.rgb(23, 31, 34))
+         }
+         header.addView(TextView(this).apply {
+-            text = "TAXI PROFIT AI · КАРТА"
++            text = "Сохранённые точки"
+             setTextColor(Color.WHITE); textSize = 17f
+         })
+         header.addView(TextView(this).apply {
+-            text = "Только дороги и улицы · без 3D и достопримечательностей"
++            text = "Подтверждённые адреса поездок"
+             setTextColor(Color.rgb(177, 195, 201)); textSize = 12f
+         })
+         val toggle = Button(this).apply {
+@@ -80,7 +86,7 @@
+         root.addView(header,hParams)
+ 
+         val footer = TextView(this).apply {
+-            text = "Спрос по тарифам: — (источник не подключён)\n✈ Аэропорт Алматы: — (источник не подключён)"
++            text = "Сохранено точек: ${LearnedPlaces.points(this@SimpleMapActivity).size}"
+             textSize = 13f
+             setTextColor(Color.WHITE)
+             setPadding(22,16,22,16)
+--- a/app/src/main/java/kz/taxiprofitai/TrialStore.kt
++++ b/app/src/main/java/kz/taxiprofitai/TrialStore.kt
+@@ -10,7 +10,7 @@
+ object TrialStore {
+     private const val NAME = "taxi_profit_trial_log"
+     private const val KEY = "trials"
+-    private const val LIMIT = 200
++    private const val LIMIT = 600
+     private val almaty = ZoneId.of("Asia/Almaty")
+ 
+     fun cityDay(timestamp: Long = System.currentTimeMillis()): LocalDate =
+@@ -35,7 +35,16 @@
+                     obj.optDouble("offlineMinutes").takeIf(Double::isFinite),
+                     obj.optDouble("actualMinutes").takeIf(Double::isFinite),
+                     obj.optDouble("actualKm").takeIf(Double::isFinite),
+-                    RideWeather.entries.firstOrNull { it.name == obj.optString("weather") } ?: RideWeather.UNKNOWN
++                    RideWeather.entries.firstOrNull { it.name == obj.optString("weather") } ?: RideWeather.UNKNOWN,
++                    obj.optBoolean("hasForecast", true),
++                    obj.optDouble("routeKm").takeIf(Double::isFinite),
++                    obj.optDouble("routeMinutes").takeIf(Double::isFinite),
++                    obj.optDouble("multiplier").takeIf(Double::isFinite),
++                    FareFactSource.entries.firstOrNull { it.name == obj.optString("priceSource") },
++                    obj.optString("receiptId").takeIf(String::isNotBlank),
++                    obj.optBoolean("excluded"),
++                    obj.optDouble("offlineKm").takeIf(Double::isFinite),
++                    obj.optBoolean("metered")
+                 )
+             }.getOrNull()
+             if (row != null && row.forecastGross.isFinite() && row.forecastGross >= 0) rows.add(row)
+@@ -45,16 +54,74 @@
+ 
+     @Synchronized fun append(context: Context, tariff: String, result: LiveFareEstimate,
+                              demand: String, latencyMs: Long, fixedSurcharge: Double? = null,
+-                             offlineMinutes: Double = result.minutes, weather: RideWeather = RideWeather.UNKNOWN): Long {
++                             offlineMinutes: Double = result.minutes, weather: RideWeather = RideWeather.UNKNOWN,
++                             multiplier: Double? = null, offlineKm: Double? = null): Long {
+         val now=System.currentTimeMillis()
+         val old=read(context)
+         val id = maxOf(now, (old.maxOfOrNull { it.id } ?: 0) + 1)
+         val row=LocalTrial(id,tariff,result.gross,result.km,result.minutes,now,demand,
+             latencyMs=latencyMs.coerceAtLeast(0L), fixedSurcharge=fixedSurcharge,
+             tariffRevision=TarifCatalog.lastVerified.takeIf { fixedSurcharge != null },
+-            offlineMinutes = offlineMinutes, weather = weather)
++            offlineMinutes = offlineMinutes, weather = weather, demandMultiplier = multiplier, offlineKm = offlineKm,
++            routeKm = result.km.takeIf { it > 0.0 }, routeMinutes = result.minutes.takeIf { it > 0.0 })
+         write(context,(listOf(row)+old).take(LIMIT))
+         return id
++    }
++
++    @Synchronized fun observedRide(context: Context, tariff: String, weather: RideWeather,
++                                   fixed: Double?, multiplier: Double?): Long {
++        val now = System.currentTimeMillis()
++        val rows = read(context)
++        val id = maxOf(now, (rows.maxOfOrNull { it.id } ?: 0) + 1)
++        val row = LocalTrial(id, tariff, 0.0, 0.0, 0.0, now, "—", fixedSurcharge = fixed,
++            tariffRevision = TarifCatalog.lastVerified, weather = weather, hasForecast = false,
++            demandMultiplier = multiplier)
++        write(context, listOf(row) + rows)
++        return id
++    }
++
++    @Synchronized fun observeFixed(context: Context, id: Long, gross: Double, route: TripBadge?) {
++        if (gross !in 1.0..100_000.0) return
++        val rows = read(context)
++        val row = rows.firstOrNull { it.id == id } ?: return
++        if (row.excluded || row.metered || row.priceSource == FareFactSource.MANUAL || row.priceSource == FareFactSource.RECEIPT) return
++        val updated = row.copy(
++            actualGross = row.actualGross ?: gross,
++            learningDay = cityDay(row.createdAtMs),
++            routeKm = route?.km ?: row.routeKm,
++            routeMinutes = route?.minutes?.toDouble() ?: row.routeMinutes,
++            priceSource = FareFactSource.FIXED
++        )
++        if (updated != row) write(context, rows.map { if (it.id == id) updated else it })
++    }
++
++    @Synchronized fun observeMetered(context: Context, id: Long) {
++        val rows = read(context)
++        val row = rows.firstOrNull { it.id == id } ?: return
++        if (row.metered) return
++        val updated = if (row.priceSource == FareFactSource.FIXED) row.copy(
++            actualGross = null, priceSource = null, learningDay = null, metered = true
++        ) else row.copy(metered = true)
++        write(context, rows.map { if (it.id == id) updated else it })
++    }
++
++    @Synchronized fun observeReceipt(context: Context, id: Long, receipt: TripReceipt): Boolean {
++        val rows = read(context)
++        if (rows.any { it.receiptId == receipt.orderId }) return false
++        val row = rows.firstOrNull { it.id == id } ?: return false
++        if (!receipt.matches(row)) return false
++        val updated = row.copy(actualGross = receipt.gross, actualMinutes = receipt.minutes ?: row.actualMinutes,
++            actualKm = receipt.km ?: row.actualKm, learningDay = cityDay(row.createdAtMs),
++            priceSource = FareFactSource.RECEIPT, receiptId = receipt.orderId,
++            fixedSurcharge = row.fixedSurcharge.takeUnless { receipt.includesExtras })
++        write(context, rows.map { if (it.id == id) updated else it })
++        return true
++    }
++
++    @Synchronized fun exclude(context: Context, id: Long) {
++        val rows = read(context)
++        val row = rows.firstOrNull { it.id == id } ?: return
++        if (!row.excluded) write(context, rows.map { if (it.id == id) row.copy(excluded = true) else it })
+     }
+ 
+     fun setActual(context: Context, id: Long, amount: Double): Boolean =
+@@ -65,17 +132,18 @@
+         km: Double? = null, automatic: Boolean = false
+     ): Boolean {
+         if (amount != null && amount !in 1.0..100_000.0) return false
+-        if (minutes != null && minutes !in 2.0..240.0) return false
+-        if (km != null && km !in 0.1..300.0) return false
++        if (minutes != null && minutes !in 0.5..240.0) return false
++        if (km != null && km !in 0.05..300.0) return false
+         if (amount == null && minutes == null && km == null) return false
+         val old = read(context)
+         val row = old.firstOrNull { it.id == id } ?: return false
+-        if (automatic && row.actualMinutes != null) return false
++        if (automatic && (row.actualMinutes != null || row.excluded)) return false
+         val updated = row.copy(
+             actualGross = amount ?: row.actualGross,
+             actualMinutes = minutes ?: row.actualMinutes,
+             actualKm = km ?: row.actualKm,
+-            learningDay = if (amount != null) cityDay(row.createdAtMs) else row.learningDay
++            learningDay = if (amount != null) cityDay(row.createdAtMs) else row.learningDay,
++            priceSource = if (amount != null) FareFactSource.MANUAL else row.priceSource
+         )
+         write(context, old.map { if (it.id == id) updated else it })
+         return true
+@@ -89,6 +157,15 @@
+                 .put("forecast",r.forecastGross).put("km",r.km)
+                 .put("minutes",r.minutes).put("date",r.createdAtMs)
+                 .put("demand",r.demandLabel)
++            if (!r.hasForecast) j.put("hasForecast", false)
++            if (r.routeKm != null) j.put("routeKm", r.routeKm)
++            if (r.routeMinutes != null) j.put("routeMinutes", r.routeMinutes)
++            if (r.demandMultiplier != null) j.put("multiplier", r.demandMultiplier)
++            if (r.priceSource != null) j.put("priceSource", r.priceSource.name)
++            if (r.receiptId != null) j.put("receiptId", r.receiptId)
++            if (r.excluded) j.put("excluded", true)
++            if (r.offlineKm != null) j.put("offlineKm", r.offlineKm)
++            if (r.metered) j.put("metered", true)
+             if (r.actualGross != null) j.put("actual",r.actualGross)
+             if (r.latencyMs != null) j.put("latencyMs",r.latencyMs)
+             if (r.fixedSurcharge != null) j.put("surcharge",r.fixedSurcharge)
+--- a/app/src/main/java/kz/taxiprofitai/TripProgress.kt
++++ b/app/src/main/java/kz/taxiprofitai/TripProgress.kt
+@@ -2,7 +2,8 @@
+ 
+ /** Visible stages after the driver has accepted an offer. */
+ data class TripProgress(
+-    val selecting: Boolean, val route: TripBadge?, val gross: Double?, val destination: String?, val tariff: String?
++    val selecting: Boolean, val route: TripBadge?, val gross: Double?, val destination: String?, val tariff: String?,
++    val metered: Boolean = false
+ )
+ 
+ object TripProgressReader {
+@@ -36,10 +37,11 @@
+                 ?: lines.getOrNull(i + 1)?.takeIf { bareDestination.matches(line) }
+             tail?.replace(clockSuffix, "")?.takeIf {
+                 it.any(Char::isLetter) && !TripBadgeReader.isMeasurement(it) &&
+-                    it.any(Char::isDigit) && !pay.containsMatchIn(it)
++                    !pay.containsMatchIn(it)
+             }
+         }.distinct().singleOrNull()
+         val payment = lines.any(pay::containsMatchIn)
++        val metered = TripReceipt.isMetered(text)
+         val caption = lines.indexOfFirst(amountCaption::containsMatchIn)
+         val active = (lines.any(finish::matches) && (payment || caption >= 0)) ||
+             (payment && destination != null && tariff != null && lines.any { clockSuffix.containsMatchIn(it) })
+@@ -62,7 +64,7 @@
+                     TripBadgeReader.parseMetrics(lines[i - 2] + " " + lines[i - 1])
+                 } else null
+         }.distinct().singleOrNull()
+-        return TripProgress(false, nav, gross, destination, tariff)
++        return TripProgress(false, nav, gross, destination, tariff, metered)
+     }
+ 
+     private fun rows(text: String) = text.replace('\u00a0', ' ').replace('\u202f', ' ')
+@@ -76,14 +78,18 @@
+     private var active: OrderTextParser.Detected? = null
+     private var activeAt: Long? = null
+ 
++    fun attachTrial(id: Long) {
++        active = active?.copy(trialId = id)
++    }
++
+     fun hasContext(now: Long) = active != null || incoming != null && now - seenAt in 0L..600_000L
+ 
+     fun remember(offer: OrderTextParser.Detected, now: Long) {
+         val prior = incoming
+-        if (prior?.destination != offer.destination || prior?.pickup != offer.pickup || prior?.tariff != offer.tariff) {
+-            selected = null
+-        }
+-        incoming = offer
++        val same = prior != null && prior.destination == offer.destination &&
++            prior.pickup == offer.pickup && prior.tariff == offer.tariff
++        if (!same) selected = null
++        incoming = if (same && offer.trialId == null) offer.copy(trialId = prior?.trialId) else offer
+         seenAt = now
+     }
+ 
+@@ -103,7 +109,7 @@
+         val next = prior?.takeIf(::matches).takeIf { last == null }
+         val linked = last ?: next
+         if (linked == null && (active != null || prior?.destination != null ||
+-                progress.gross == null || progress.tariff == null)) return null
++                progress.tariff == null || (progress.gross == null && !progress.metered))) return null
+         if (last == null) activeAt = null
+         val selectedForTrip = selected.takeIf { next != null }
+         if (next != null) {
+@@ -114,7 +120,8 @@
+         val chosen = selectedForTrip ?: linked?.tripBadge
+         val earlyNav = progress.route?.takeIf { now - started in 0L..60_000L &&
+             (chosen == null || it.km in chosen.km * 0.90..chosen.km * 1.12) }
+-        val actualPrice = progress.gross ?: linked?.displayedGross?.takeIf { last != null }
++        val actualPrice = if (progress.metered) null
++            else progress.gross ?: linked?.displayedGross?.takeIf { last != null }
+         val quote = (linked ?: OrderTextParser.Detected(
+             true, progress.tariff, null, false, null, match, null, null
+         )).copy(displayedGross = actualPrice,
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/TripReceipt.kt
+@@ -0,0 +1,59 @@
++package kz.taxiprofitai
++
++enum class FareFactSource { FIXED, RECEIPT, MANUAL }
++
++data class TripReceipt(val orderId: String, val gross: Double, val minutes: Double?, val km: Double?, val tariff: String? = null, val includesExtras: Boolean = false) {
++    fun matches(row: LocalTrial): Boolean {
++        if (tariff != row.tariff || row.excluded) return false
++        val minutesMatch = minutes != null && row.actualMinutes != null &&
++            kotlin.math.abs(row.actualMinutes - minutes) <= maxOf(1.0, minutes * 0.15)
++        val kmMatch = km != null && row.actualKm != null &&
++            kotlin.math.abs(row.actualKm - km) <= maxOf(0.75, km * 0.2)
++        if (minutes != null && row.actualMinutes != null && !minutesMatch ||
++            km != null && row.actualKm != null && !kmMatch) return false
++        return minutesMatch || kmMatch || row.priceSource == FareFactSource.FIXED && row.actualGross == gross
++    }
++
++    companion object {
++        fun read(text: String): TripReceipt? {
++            val rows = text.replace('\u00a0', ' ').replace('\u202f', ' ')
++                .lines().map(String::trim).filter(String::isNotEmpty)
++            fun values(label: String): List<String> {
++                val field = Regex("""(?iu)^${Regex.escape(label)}(?:\s*[:·]?\s*(.*))?$""")
++                return rows.mapIndexedNotNull { index, row ->
++                    field.matchEntire(row)?.groupValues?.get(1)?.trim()?.ifEmpty { rows.getOrNull(index + 1).orEmpty() }
++                }.distinct()
++            }
++            if (!rows.any { it.equals("Детали заказа", true) || it.equals("Расчёт стоимости", true) ||
++                    it.equals("Расчет стоимости", true) }) return null
++            val finished = values("Статус").singleOrNull()?.lowercase()?.replace('ё', 'е')
++            if (finished !in setOf("завершен", "завершена", "выполнен", "выполнена")) return null
++            val id = values("Номер заказа").singleOrNull()?.let {
++                Regex("""^\d{6,20}$""").find(it)?.value
++            } ?: return null
++            val money = Regex("""(?iu)^(\d{1,7}|\d{1,3}(?: \d{3})+)\s*(?:₸|kzt|тг\.?|тенге|т)$""")
++            val gross = values("Оплата от пассажира").singleOrNull()?.let {
++                money.matchEntire(it)?.groupValues?.get(1)?.replace(" ", "")?.toDoubleOrNull()
++            }?.takeIf { it in 1.0..100_000.0 } ?: return null
++            val extras = rows.any {
++                Regex("""(?iu)^(?:чаевые|платное ожидание|скидка|бонус|доплата)(?:\s|$)""").containsMatchIn(it)
++            }
++            val time = values("Длительность поездки").singleOrNull()?.let {
++                Regex("""^(\d{1,2}):(\d{2})(?::(\d{2}))?$""").matchEntire(it)?.destructured
++            }?.let { (first, second, third) ->
++                if (third.isEmpty()) first.toInt() + second.toInt() / 60.0
++                else first.toInt() * 60.0 + second.toInt() + third.toInt() / 60.0
++            }?.takeIf { it in 0.5..240.0 }
++            val km = values("Пробег").singleOrNull()?.let {
++                Regex("""(?iu)^(\d+(?:[,.]\d+)?)\s*(км|м)$""").matchEntire(it)?.destructured
++            }?.let { (number, unit) ->
++                number.replace(',', '.').toDouble() / if (unit.equals("м", true)) 1000.0 else 1.0
++            }?.takeIf { it in 0.05..300.0 }
++            return TripReceipt(id, gross, time, km, TarifCatalog.forName(values("Тариф").singleOrNull())?.title, extras)
++        }
++
++        fun isMetered(text: String): Boolean = Regex(
++            """(?iu)(?<!\p{L})(?:по\s+таксометру|стоимость\s+по\s+сч[её]тчику|цена\s+по\s+сч[её]тчику)(?!\p{L})"""
++        ).containsMatchIn(text)
++    }
++}
+--- /dev/null
++++ b/core-tests/AutoLearningCheck.kt
+@@ -0,0 +1,59 @@
++package kz.taxiprofitai
++
++import java.time.Instant
++import kotlin.math.abs
++
++fun main() {
++    val now = Instant.parse("2026-11-25T13:00:00Z").toEpochMilli()
++    val base = TarifCatalog.forName("Комфорт+")!!
++    val observed = base.copy(start = 725.0, perKm = 91.0, perMinute = 47.0)
++    val rows = List(48) { index ->
++        val km = listOf(1.2, 3.2, 4.4, 8.4, 10.1, 17.1, 2.5, 7.1, 11.2)[index % 9]
++        val minutes = listOf(5.0, 14.0, 10.0, 36.0, 27.0, 30.0, 8.0)[index % 7]
++        val plus = if (index % 3 == 0) 100.0 else 0.0
++        val route = RouteEstimate(km, minutes)
++        LocalTrial(index.toLong(), base.title, FareEngine.base(base, route) + plus, km, minutes,
++            now - (48L - index) * 1_800_000, "test", FareEngine.base(observed, route) + plus,
++            fixedSurcharge = plus, tariffRevision = TarifCatalog.lastVerified, priceSource = FareFactSource.FIXED,
++            demandMultiplier = 1.0, offlineKm = km, actualKm = km * 1.05)
++    }
++    check(LearnedRates.fit(base, rows.take(4), now) == null)
++    check(LearnedRates.fit(base, rows.map { it.copy(excluded = true) }, now) == null)
++    val fit = LearnedRates.fit(base, rows, now)!!
++    for ((km, minutes) in listOf(2.0 to 9.0, 6.0 to 18.0, 12.0 to 25.0)) {
++        val trip = RouteEstimate(km, minutes)
++        val actual = FareEngine.base(observed, trip)
++        check(abs(FareEngine.base(fit.rateFor(km), trip) - actual) < abs(FareEngine.base(base, trip) - actual))
++    }
++    check(RideTimeLearning.distance(6.0, rows, now) > 6.0)
++    val receipt = "Детали заказа\nСтатус\nЗавершен\nНомер заказа\n32203845\nТариф\nКомфорт+\n" +
++        "Оплата от пассажира\n4 090 KZT\nКомиссия парка\n-41 KZT\nДлительность поездки\n01:31:02\nПробег\n12 км"
++    val parsed = TripReceipt.read(receipt)!!
++    check(parsed.orderId == "32203845" && parsed.gross == 4090.0 && parsed.km == 12.0)
++    check(abs(parsed.minutes!! - 91.0333) < 0.001)
++    check(TripReceipt.read(receipt.replace("Завершен", "Отменен")) == null)
++    check(TripReceipt.read(receipt + "\nЧаевые")!!.includesExtras)
++    check(parsed.matches(rows.first().copy(actualKm = 12.0, actualMinutes = 91.0)))
++    check(!parsed.matches(rows.first()))
++    check(TripReceipt.isMetered("Стоимость по таксометру"))
++
++    val first = OrderTextParser.parse("20 м · 1 мин\nБлижняя подача\nКомфорт+\n" +
++        "А улица Манаса, 22Д\nБ Каблан, ул. Наурызбай батыра, 154, Алматы\nПассажир\nПринять ×1.00").copy(trialId = 17)
++    val next = first.copy(pickup = "улица Наурызбай батыра, 156", destination = "улица Пирогова, 32", trialId = 18)
++    val state = TripProgressState()
++    val priceA = TripProgress(false, null, 910.0, "ул. Наурызбай батыра, 154", "Комфорт+")
++    state.remember(first, 1_000)
++    check(state.update(priceA, 2_000)?.trialId == 17L)
++    state.remember(next, 3_000)
++    check(state.update(priceA, 4_000)?.trialId == 17L)
++    state.finishActive()
++    check(state.update(priceA, 5_000) == null)
++    check(state.update(TripProgress(false, null, null, next.destination, next.tariff, metered = true), 6_000)?.trialId == 18L)
++    val timing = RideTiming()
++    timing.startVerified(17, first.destination!!, 1_000)
++    timing.offer(18, next.destination!!, 2_000)
++    check(timing.observe(RidePhase.COMPLETED, emptyList(), 61_000) == RideTiming.Fact(17, 1.0))
++    timing.startVerified(18, next.destination, 65_000)
++    check(timing.observe(RidePhase.COMPLETED, emptyList(), 125_000) == RideTiming.Fact(18, 1.0))
++    println("Verified automatic price pairing, receipt rules, queued rides, and learning across distances")
++}
