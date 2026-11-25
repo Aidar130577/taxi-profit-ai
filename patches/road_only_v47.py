@@ -60,7 +60,7 @@ s = s[:a] + """        // Show a short explanation only while a usable fare is u
 """ + s[b:]
 # Width is specified in the window and also in the view's measurement.
 assert s.count("(240 * density).toInt()") == 1
-s = s.replace("(240 * density).toInt()", "(192 * density).toInt()")
+s = s.replace("(240 * density).toInt()", "(168 * density).toInt()")
 assert "if (logicalHeight != oldHeight) requestLayout()" in s
 assert s.index("hasQuote = estimate != null") < s.index("if (logicalHeight != oldHeight) requestLayout()")
 # Two equal columns: Yandex gross and take-home amount.
@@ -70,16 +70,21 @@ s = s[:a] + """        line(c,29f)
         paint.color = Color.WHITE
         paint.strokeWidth = 1f
         c.drawLine(120f, 34f, 120f, 76f, paint)
-        text(c,"яндекс",60f,46f,18f,yellow,true,Paint.Align.CENTER,110f)
-        text(c,"на руки",180f,46f,18f,green,true,Paint.Align.CENTER,110f)
-        text(c,gross.removePrefix("СТОИМОСТЬ ").replace("≈", "").trim(),60f,70f,18f,yellow,true,Paint.Align.CENTER,110f,true)
-        text(c,net.removePrefix("НА РУКИ "),180f,70f,18f,green,true,Paint.Align.CENTER,110f,true)
+        text(c,"яндекс",60f,46f,16f,yellow,true,Paint.Align.CENTER,110f)
+        text(c,"на руки",180f,46f,16f,green,true,Paint.Align.CENTER,110f)
+        text(c,gross.removePrefix("СТОИМОСТЬ ").replace("≈", "").trim(),60f,70f,22f,yellow,true,Paint.Align.CENTER,110f,true)
+        text(c,net.removePrefix("НА РУКИ "),180f,70f,22f,green,true,Paint.Align.CENTER,110f,true)
 """ + s[b:]
+# Match the header and amount nominal font sizes; existing text() width fitting
+# keeps long tariff names, surcharges and high-value amounts inside the panel.
+import re
+s, count = re.subn(r'(text\(c,title,[^,\n]+,[^,\n]+,)\d+(?:\.\d+)?f', r'\g<1>22f', s)
+assert count == 1, "Expected one tariff header draw call"
 p.write_text(s)
 
 p = root / "RadarAccessibilityService.kt"
 s = p.read_text()
 assert s.count("minOf(dp(240), screenWidth())") == 1
-s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(192), screenWidth())")
+s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(168), screenWidth())")
 p.write_text(s)
-print("Compact overlay: 192dp wide, 65.6dp fare height, 30.4dp waiting height; status only for missing fare.")
+print("Compact overlay: 168dp wide, 57.4dp fare height, 26.6dp waiting height; status only for missing fare.")
