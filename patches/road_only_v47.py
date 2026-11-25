@@ -60,7 +60,7 @@ s = s[:a] + """        // Show a short explanation only while a usable fare is u
 """ + s[b:]
 # Width is specified in the window and also in the view's measurement.
 assert s.count("(240 * density).toInt()") == 1
-s = s.replace("(240 * density).toInt()", "(168 * density).toInt()")
+s = s.replace("(240 * density).toInt()", "(152 * density).toInt()")
 assert "if (logicalHeight != oldHeight) requestLayout()" in s
 assert s.index("hasQuote = estimate != null") < s.index("if (logicalHeight != oldHeight) requestLayout()")
 # Two equal columns: Yandex gross and take-home amount.
@@ -100,6 +100,32 @@ s = s.replace(anchor, """    private val compactAmountPaint = Paint(Paint.ANTI_A
     }
 
 """ + anchor)
+# Keep the existing tariff codes, not the full English names. Display only;
+# fare lookup continues to use the original detected tariff.
+import re
+s, count = re.subn(r'(?m)^        title=when\(tariff\)\{[^\n]+\} existing text() width fitting
+# keeps long tariff names, surcharges and high-value amounts inside the panel.
+import re
+s, count = re.subn(r'(text\(c,title,[^,\n]+,[^,\n]+,)\d+(?:\.\d+)?f', r'\g<1>22f', s)
+assert count == 1, "Expected one tariff header draw call"
+p.write_text(s)
+
+p = root / "RadarAccessibilityService.kt"
+s = p.read_text()
+assert s.count("minOf(dp(240), screenWidth())") == 1
+s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(152), screenWidth())")
+p.write_text(s)
+print("Compact overlay: 152dp wide, 51.9dp fare height, 24.1dp waiting height; status only for missing fare.")
+, '''        title = "Тариф " + when (tariff.trim().uppercase(java.util.Locale.ROOT)) {
+            "EK", "ЕК", "ECONOMY", "ЭКОНОМ" -> "EK"
+            "K", "К", "COMFORT", "КОМФОРТ" -> "K"
+            "K+", "К+", "COMFORT+", "КОМФОРТ+" -> "K+"
+            "EV", "ELECTRIC", "ЭЛЕКТРО" -> "EV"
+            "BS", "BUSINESS", "БИЗНЕС" -> "BS"
+            "PR", "PREMIER", "ПРЕМЬЕР" -> "PR"
+            else -> tariff.trim()
+        }''', s)
+assert count == 1, "Expected original tariff title mapping"
 # Match the header and amount nominal font sizes; existing text() width fitting
 # keeps long tariff names, surcharges and high-value amounts inside the panel.
 import re
@@ -110,6 +136,6 @@ p.write_text(s)
 p = root / "RadarAccessibilityService.kt"
 s = p.read_text()
 assert s.count("minOf(dp(240), screenWidth())") == 1
-s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(168), screenWidth())")
+s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(152), screenWidth())")
 p.write_text(s)
-print("Compact overlay: 168dp wide, 57.4dp fare height, 26.6dp waiting height; status only for missing fare.")
+print("Compact overlay: 152dp wide, 51.9dp fare height, 24.1dp waiting height; status only for missing fare.")
