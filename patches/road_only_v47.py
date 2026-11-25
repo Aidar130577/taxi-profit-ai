@@ -119,26 +119,15 @@ assert count == 1, "Expected original tariff title mapping"
 s, count = re.subn(r'(text\(c,title,[^,\n]+,[^,\n]+,)\d+(?:\.\d+)?f', r'\g<1>22f', s)
 assert count == 1, "Expected one tariff header draw call"
 
-# Day mode restores the original dark panel; night mode uses light cyan
-# against the dark map, with the same text colors as day mode (user approved).
-anchor = "        paint.color = Color.rgb(22, 32, 39)"
+# Single approved dark design on both map themes. Increase yellow
+# border thickness from 2 to 5 logical pixels (3dp at 144dp width).
+anchor = "        paint.strokeWidth = 2f\n        paint.color = yellow"
 assert s.count(anchor) == 1
-a = s.index("    override fun onDraw(c:Canvas){")
-b = s.index("    fun showQuote(", a)
-draw = s[a:b]
-draw = draw.replace("Color.WHITE", "panelInk")
-draw = re.sub(r'\byellow\b', 'panelGold', draw)
-draw = re.sub(r'\bgreen\b', 'panelGreen', draw)
-draw = re.sub(r'\bpurple\b', 'panelPurple', draw)
-draw = draw.replace(anchor, """        val nightMap = context.getSharedPreferences("taxi_profit_settings", android.content.Context.MODE_PRIVATE)
-            .getBoolean("overlay_night_map", true)
-        val panelInk = Color.WHITE
-        val panelGold = yellow
-        val panelGreen = green
-        val panelPurple = purple
-        paint.color = if (nightMap) Color.rgb(186, 242, 255) else Color.rgb(22, 32, 39)""")
-draw = draw.replace("        paint.color = panelGold\n        c.drawRoundRect", "        paint.color = if (nightMap) Color.rgb(0, 83, 212) else yellow\n        c.drawRoundRect")
-s = s[:a] + draw + s[b:]
+s = s.replace(anchor, "        paint.strokeWidth = 5f\n        paint.color = yellow")
+# Keep the thicker stroke entirely inside the measured window.
+anchor = "RectF(1f, 1f, 239f, logicalHeight - 1f)"
+assert s.count(anchor) == 1
+s = s.replace(anchor, "RectF(3f, 3f, 237f, logicalHeight - 3f)")
 
 p.write_text(s)
 
@@ -148,18 +137,4 @@ assert s.count("minOf(dp(240), screenWidth())") == 1
 s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(144), screenWidth())")
 p.write_text(s)
 
-p = root / "MainActivity.kt"
-s = p.read_text()
-anchor = "        root.addView(setupButton,LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,dp(48)))"
-assert s.count(anchor) == 1
-s = s.replace(anchor, '''        val nightMapButton = action(if (prefs.getBoolean("overlay_night_map", true))
-            "Плашка: ночной режим" else "Плашка: дневной режим") { }
-        nightMapButton.setOnClickListener {
-            val night = !prefs.getBoolean("overlay_night_map", true)
-            prefs.edit().putBoolean("overlay_night_map", night).apply()
-            nightMapButton.text = if (night) "Плашка: ночной режим" else "Плашка: дневной режим"
-        }
-        root.addView(nightMapButton)
-''' + anchor)
-p.write_text(s)
-print("Compact overlay: 144dp x 57.6dp; night-map pale cyan / day-map original dark; persistent manual toggle.")
+print("Compact overlay: 144dp x 57.6dp; single dark theme with thick yellow border; no theme selector.")
