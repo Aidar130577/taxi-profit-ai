@@ -22,17 +22,6 @@ replace(path,"    cost += distanceCost;\n\n    return cost;",
       return streetTimeCost(km, cf, dist, cosangle, isStartpoint, nsection, lastpriorityclassifier);
     }
     return cost;""")
-# In the search phase (no detail message), do not evaluate vehicle dynamics on
-# discarded alternatives. The guided retrace sets message and computes real ETA.
-replace(path, "    double cost = 0.;\n    double extraTime = 0.;",
-    """    if (km.shortestDistance && message == null) {
-      float cf = rc.expctxWay.getCostfactor();
-      if (cf >= 9999.f || km.getWayMaxspeed() <= 0.f) return -1.;
-      return streetTimeCost(km, cf, dist, cosangle, isStartpoint, nsection, lastpriorityclassifier);
-    }
-
-    double cost = 0.;
-    double extraTime = 0.;""")
 # Single cheap objective for both A* and guided retrace:
 # road-weighted physical distance + estimated driving-time cost.
 # ETA output still uses the original kinematic integration on the chosen path.
@@ -53,6 +42,17 @@ replace(path, "  protected double evolveDistance(KinematicModel km, double dist,
   }
 
   protected double evolveDistance(KinematicModel km, double dist, double delta_h, double f_air) {""")
+# In the search phase (no detail message), do not evaluate vehicle dynamics on
+# discarded alternatives. The guided retrace sets message and computes real ETA.
+replace(path, "    double cost = 0.;\n    double extraTime = 0.;",
+    """    if (km.shortestDistance && message == null) {
+      float cf = rc.expctxWay.getCostfactor();
+      if (cf >= 9999.f || km.getWayMaxspeed() <= 0.f) return -1.;
+      return streetTimeCost(km, cf, dist, cosangle, isStartpoint, nsection, lastpriorityclassifier);
+    }
+
+    double cost = 0.;
+    double extraTime = 0.;""")
 # Skip construction of crossing/turn slowdown hints during the distance-only
 # search; leave the regular link loading and detailed ETA pass intact.
 engine=root/"brouter-core/src/main/java/btools/router/RoutingEngine.java"
