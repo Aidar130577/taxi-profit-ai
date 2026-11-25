@@ -289,7 +289,7 @@
 +            }
 +            val w = right - left + 1
 +            val h = bottom - top + 1
-+            if (w in (width * 0.21)..(width * 0.65) && h in (width * 0.055)..(width * 0.20) &&
++            if (w.toDouble() in (width * 0.21)..(width * 0.65) && h.toDouble() in (width * 0.055)..(width * 0.20) &&
 +                w.toDouble() / h in 1.8..4.8 && tail > w * h * 0.33) {
 +                found.add(tail to Box(left, top, right + 1, bottom + 1))
 +            }
