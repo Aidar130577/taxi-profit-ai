@@ -70,8 +70,8 @@ s = s[:a] + """        line(c,29f)
         paint.color = Color.WHITE
         paint.strokeWidth = 1f
         c.drawLine(120f, 34f, 120f, 76f, paint)
-        text(c,"Яндекс",60f,46f,18f,yellow,true,Paint.Align.CENTER,110f)
-        text(c,"На руки",180f,46f,18f,green,true,Paint.Align.CENTER,110f)
+        text(c,"яндекс",60f,46f,18f,yellow,true,Paint.Align.CENTER,110f)
+        text(c,"на руки",180f,46f,18f,green,true,Paint.Align.CENTER,110f)
         text(c,gross.removePrefix("СТОИМОСТЬ ").replace("≈", "").trim(),60f,70f,18f,yellow,true,Paint.Align.CENTER,110f,true)
         text(c,net.removePrefix("НА РУКИ "),180f,70f,18f,green,true,Paint.Align.CENTER,110f,true)
 """ + s[b:]
