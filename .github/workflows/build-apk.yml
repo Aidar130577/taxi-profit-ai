@@ -101,6 +101,7 @@ jobs:
           python3 ../patches/calculator_overlay_v24.py
           patch --batch -p1 < ../patches/calculator-v25.patch
           patch --batch -p1 < ../patches/calculator-v26.patch
+          patch --batch -p1 < ../patches/calculator-v27.patch
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -122,7 +123,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 26').replace('0.17.0-approved-overlays', '0.26.0-ev'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 27').replace('0.17.0-approved-overlays', '0.27.0-order-addresses'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -161,17 +162,17 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='26'" apk-badging.txt
+          grep -q "versionCode='27'" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
-          cp "$APK" ZnayTsenu-v26.apk
+          cp "$APK" ZnayTsenu-v27.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v26-branded-apk
-          path: ZnayTsenu-v26.apk
+          name: ZnayTsenu-v27-branded-apk
+          path: ZnayTsenu-v27.apk
           retention-days: 7
           if-no-files-found: error

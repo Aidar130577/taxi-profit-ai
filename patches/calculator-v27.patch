@@ -1,0 +1,282 @@
+--- a/app/src/main/java/kz/taxiprofitai/Engine.kt
++++ b/app/src/main/java/kz/taxiprofitai/Engine.kt
+@@ -148,7 +148,12 @@
+                         val verifiedHighDemandDiscount: Boolean = false, val displayedGross: Double? = null)
+     private val fixed = Regex("\\+\\s*(\\d[\\d\\s]*)\\s*[₸Т](?!\\w)", RegexOption.IGNORE_CASE)
+     private val mult = Regex("[×xх]\\s*(\\d+[,.]\\d+)", RegexOption.IGNORE_CASE)
+-    private val pickup = Regex("(\\d+[,.]\\d+)\\s*км\\s*[·•\\-]\\s*(\\d+)\\s*мин", RegexOption.IGNORE_CASE)
++    private val pickup = Regex("""(?iu)(\d+(?:[,.]\d+)?)\s*(км|м)\s*[·•.\-]\s*(\d+)\s*мин""")
++    private val routeMarker = Regex("""(?iu)^\s*(?:\(([АAБB])\)|([АAБB])(?=[:.)\s]|$))\s*[:.)]?\s*(.*)$""")
++    private val routeAddress = Regex(
++        """(?iu)\b(?:улица|проспект|микрорайон|переулок|шоссе|бульвар|площадь|паркинг|plaza|mall|торговый центр|ТРЦ)\b|,\s*(?:вход|выход)\b|,\s*\d+\s*[А-ЯA-Z]?(?:\s*(?:к|корп(?:ус)?\.?|/)\s*\d+[А-ЯA-Z]?)?\s*$"""
++    )
++    private val neutralBoost = Regex("""(?iu)(?<![\p{L}\d])[×xх]\s*1[.,]0{1,2}(?![\d.,])""")
+     private val excludedOrder = Regex("(?iu)(?<![\\p{L}])(доставка|курьер|грузовой|яндекс\\s+еда|межгород|вместе)(?![\\p{L}])")
+     private val displayedFare = Regex(
+         """(?iu)^\s*(?:стоимость(?:\s+поездки)?|цена(?:\s+поездки)?|сумма\s+заказа)\s*[:—–-]?\s*(\d{1,3}(?:[ \u202f]\d{3})+|\d{1,6})(?:[,.](\d{1,2}))?\s*(?:₸|тенге|тг\.?)\s*$"""
+@@ -181,27 +186,39 @@
+             isOrder && addresses.any { it.equals("Пассажир", ignoreCase = true) } -> "Электро"
+             else -> null
+         }
+-        fun extract(marker: String): String? {
+-            // Yandex accessibility trees may expose the marker as a separate node.
+-            val i = addresses.indexOfFirst { it == marker || it.startsWith("$marker ") || it.startsWith("$marker:") }
+-            if (i < 0) return null
+-            val s = addresses[i]
+-            if (s.length > 2) return s.drop(1).trim(' ', ':')
+-            return addresses.getOrNull(i+1)?.takeIf { it.length > 5 && it != "Пропустить" && it != "Принять" }
+-        }
+-        val pickupIndex=addresses.indexOfFirst{it.contains("подача",true)}
+-        val passengerIndex=addresses.indexOfFirst{it.contains("Пассажир",true)}
+-        val body=if(pickupIndex>=0 && passengerIndex>pickupIndex)addresses.subList(pickupIndex+1,passengerIndex) else emptyList()
+-        val candidates=body.map{it.replace(Regex("^[АAБB]\\s*[:.)]?\\s+"),"").trim()}.filter{
+-            it.length>=7 && !TarifCatalog.titles.any{n->it.equals(n,true)} &&
+-            (Regex("(?iu)улица|проспект|микрорайон|переулок|шоссе|бульвар|площадь|паркинг|plaza|mall|торговый центр|ТРЦ").containsMatchIn(it) ||
+-                Regex("(?u),\\s*\\d+[А-Яа-яA-Za-z]?\\s*$").containsMatchIn(it))
+-        }.distinct()
+-        val fallback=candidates.takeIf{it.size==2 && isOrder}
+-        val a = extract("А") ?: extract("A") ?: fallback?.get(0)
+-        val b = extract("Б") ?: extract("B") ?: fallback?.get(1)
+-        return Detected(isOrder,tariff,if(isOrder)OfferDemandEvidence.direct(t) ?: OfferDemandEvidence.acceptButton(t) else d,t.contains("аэропорт",true), a,b,
+-            pm?.groupValues?.get(1)?.replace(",",".")?.toDoubleOrNull(), pm?.groupValues?.get(2)?.toIntOrNull(),
++        fun extract(vararg markers: String): String? {
++            for ((index, line) in addresses.withIndex()) {
++                val match = routeMarker.matchEntire(line) ?: continue
++                val marker = match.groupValues[1].ifEmpty { match.groupValues[2] }
++                if (markers.none { it.equals(marker, ignoreCase = true) }) continue
++                val address = match.groupValues[3].ifBlank { addresses.getOrNull(index + 1).orEmpty() }
++                if (address.length > 5 && routeMarker.matchEntire(address) == null &&
++                    TarifCatalog.titles.none { it.equals(address, ignoreCase = true) } &&
++                    !address.startsWith("Пассажир", ignoreCase = true)) return address
++            }
++            return null
++        }
++        val pickupIndex = addresses.indexOfFirst { it.contains("подача", true) }
++        val passengerIndex = addresses.indexOfFirst { it.startsWith("Пассажир", true) }
++        val acceptIndex = addresses.indexOfLast { it.contains("Принять", true) }
++        val end = if (passengerIndex > pickupIndex) passengerIndex else acceptIndex
++        val body = if (pickupIndex >= 0 && end > pickupIndex) addresses.subList(pickupIndex + 1, end) else emptyList()
++        val candidates = body.map { routeMarker.matchEntire(it)?.groupValues?.get(3) ?: it }
++            .map(String::trim).filter { it.length >= 7 && routeAddress.containsMatchIn(it) }.distinct()
++        val fallback = candidates.takeIf { it.size == 2 && isOrder }
++        val a = extract("А", "A") ?: fallback?.get(0)
++        val b = extract("Б", "B") ?: fallback?.get(1)
++        // A multiplier of exactly one on the accept control is a confirmed absence of extra demand.
++        val noIncrease = acceptIndex >= 0 && addresses.drop(acceptIndex).take(2).any(neutralBoost::containsMatchIn)
++        val demand = if (isOrder) OfferDemandEvidence.direct(t) ?: OfferDemandEvidence.acceptButton(t)
++            ?: Demand(DemandType.NONE, verified = true).takeIf { noIncrease } else d
++        val approachKm = pm?.let { match ->
++            match.groupValues[1].replace(",", ".").toDoubleOrNull()?.let { kmOrMetres ->
++                if (match.groupValues[2].equals("м", ignoreCase = true)) kmOrMetres / 1000 else kmOrMetres
++            }
++        }
++        return Detected(isOrder, tariff, demand, t.contains("аэропорт",true), a,b,
++            approachKm, pm?.groupValues?.get(3)?.toIntOrNull(),
+             t.contains("Очень высокий спрос",true) && t.contains("Комиссия снижена",true),
+             if (isOrder && tariff != null) visibleFare(addresses) else null)
+     }
+--- a/app/src/main/java/kz/taxiprofitai/MainActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/MainActivity.kt
+@@ -105,6 +105,9 @@
+         }
+         root.addView(stop)
+         root.addView(action("История прогнозов"){ showLearningHistory() })
++        if (android.os.Build.VERSION.SDK_INT >= 34) {
++            root.addView(action("Распознавание адресов"){ showOcrSettings() })
++        }
+         scroll.addView(root)
+         setContentView(scroll)
+         root.requestFocus()
+@@ -166,6 +169,18 @@
+         }.apply()
+         return true
+     }
++    private fun showOcrSettings() {
++        val active = prefs.getBoolean("ocr_allowed", false)
++        android.app.AlertDialog.Builder(this)
++            .setTitle("Распознавание адресов")
++            .setMessage("Если Android не передаёт адреса карточки заказа, приложение может прочитать снимок окна Яндекс Про на телефоне. Снимок не сохраняется и не отправляется.")
++            .setNegativeButton("Закрыть", null)
++            .setPositiveButton(if (active) "Выключить" else "Включить") { _, _ ->
++                prefs.edit().putBoolean("ocr_choice", true).putBoolean("ocr_allowed", !active).apply()
++            }
++            .show()
++    }
++
+     private fun showLearningHistory() {
+         val rows = TrialStore.read(this).filter { it.fixedSurcharge != null && it.tariffRevision != null }
+         val dialog = android.app.AlertDialog.Builder(this)
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
+@@ -79,6 +79,7 @@
+             status.startsWith("Надбавка неизвестна") -> "База · надбавка неизвестна"
+             status.startsWith("Надбавка") -> "Не считана надбавка"
+             status.startsWith("Адреса") -> "Не считаны адреса"
++            status.startsWith("Адрес не найден") -> status
+             status.startsWith("Нет маршрута") -> "Нет маршрута BRouter"
+             status.startsWith("Маршрут") -> "Считаем…"
+             status == "Учтён опыт поездок" -> status
+--- a/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
+@@ -53,8 +53,9 @@
+         else {
+             @Suppress("DEPRECATION")
+             val geocoder=Geocoder(appContext,Locale("ru","KZ"))
+-            val cleaned=raw.replace(Regex("(?iu),?\\s*(?:выход|вход)\\s+на\\s+паркинг.*$"),"").trim()
+-            val queries=listOf(raw,cleaned).filter{it.isNotBlank()}.distinct()
++            val cleaned = raw.replace(Regex("""(?iu),\s*(?:выход|вход)\b.*$"""), "").trim()
++            val expanded = cleaned.replace(Regex("""(?iu)(\d+[а-я]?)[кk](\d+[а-я]?)$"""), "$1 корпус $2")
++            val queries = listOf(raw, expanded, cleaned).filter { it.isNotBlank() }.distinct()
+             val list=queries.asSequence().map{q->
+                 runCatching{geocoder.getFromLocationName("$q, Алматы, Казахстан",5)}.getOrNull()
+             }.firstOrNull{items->items?.any{it.latitude in 42.5..44.5 && it.longitude in 75.0..79.0}==true}
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -25,6 +25,10 @@
+     private lateinit var windows: WindowManager
+     private var ocr: WindowOcr?=null
+     private var scanGeneration=0L
++    private data class OcrOrder(val windowId: Int, val visible: String, val order: OrderTextParser.Detected)
++    private var currentNativeText = ""
++    private var currentNativeWindow = -1
++    private var cachedOcrOrder: OcrOrder? = null
+     private var ocrEpoch=0L
+     private var lastOcr=0L
+     private var ocrBusy=false
+@@ -161,6 +165,7 @@
+         verifiedIdentity=null;verifiedDemand=null;verifiedAt=0L
+         routeKey=null;estimate=null;routeStatus="";nonOrderSnapshots=0
+         routeGeneration++
++        cachedOcrOrder = null
+         loggedOffer = false
+         loggedIdentity = null
+         offerPopupState.clear()
+@@ -209,7 +214,11 @@
+         }
+         walk(root,0)
+         val visible=texts.distinct().joinToString("\n")
+-        val newer=OrderTextParser.parse(visible)
++        val native = OrderTextParser.parse(visible)
++        currentNativeText = visible
++        currentNativeWindow = root.windowId
++        if (windowChanged) cachedOcrOrder = null
++        val newer = cachedOcrOrder?.takeIf { it.windowId == root.windowId && it.visible == visible }?.order ?: native
+         val generation=++scanGeneration
+         val incomplete = newer.tariff == null || (newer.displayedGross == null &&
+             (newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank() || newer.demand == null))
+@@ -238,13 +247,15 @@
+                             val active=rootInActiveWindow
+                             if(active?.packageName?.toString()!="ru.yandex.taximeter" || active.windowId!=windowId)return@post
+                             if(System.currentTimeMillis()-now>5000L)return@post
+-                            if(scanGeneration!=generation && !detected.order)return@post
++                            if (currentNativeWindow != windowId || currentNativeText != visible) return@post
++                            if (scanGeneration != generation && !detected.order) return@post
+                             val original=OrderTextParser.parse(visible)
+                             val candidate=OrderTextParser.parse(reading.text.orEmpty())
+                             val merged=if(original.order)original.copy(
+                                 pickup=original.pickup ?: candidate.pickup,
+                                 destination=original.destination ?: candidate.destination,
+-                                tariff=original.tariff ?: candidate.tariff
++                                tariff=original.tariff ?: candidate.tariff,
++                                displayedGross=original.displayedGross ?: candidate.displayedGross.takeIf { candidate.order }
+                             ) else candidate
+                             val demand=OfferDemandEvidence.merge(original.demand ?: candidate.demand,reading.purple)
+                             if (!merged.order || merged.tariff == null || (demand == null && merged.displayedGross == null &&
+@@ -258,7 +269,11 @@
+                             if(!detected.order && scanGeneration!=generation)return@post
+                             verifiedIdentity=OfferPopupState.identity(merged.pickup,merged.destination,merged.tariff)
+                             verifiedDemand=demand;verifiedAt=System.currentTimeMillis()
+-                            processDetection(merged.copy(demand=demand),false)
++                            val corrected = merged.copy(demand = demand)
++                            if (original.order && (original.pickup != null || original.destination != null)) {
++                                cachedOcrOrder = OcrOrder(windowId, visible, corrected)
++                            }
++                            processDetection(corrected,false)
+                         }
+                     }
+                 }
+@@ -337,7 +352,8 @@
+                                 else -> "Офлайн BRouter • без живых пробок"
+                             }
+                         }, onFailure = {
+-                            routeStatus = "Нет маршрута: ${result.exceptionOrNull()?.message?.take(64)}"
++                            routeStatus = if (result.exceptionOrNull()?.message?.startsWith("Не удалось найти адрес") == true)
++                                "Адрес не найден на карте" else "Нет маршрута BRouter"
+                         })
+                         render()
+                     }
+--- a/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
++++ b/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
+@@ -47,11 +47,14 @@
+                         bitmap=hw?.copy(Bitmap.Config.ARGB_8888,false)
+                         if(bitmap!=null && !closed){
+                             val api=engine()
+-                            api.setImage(bitmap)
+-                            try {
+-                                val raw=api.getUTF8Text()
+-                                if(api.meanConfidence()>=75)text=raw
+-                            } finally {api.clear()}
++                            text = readOrderCard(bitmap, api)
++                            if (text == null) {
++                                api.setImage(bitmap)
++                                try {
++                                    val raw = api.getUTF8Text()
++                                    if (api.meanConfidence() >= 75) text = raw
++                                } finally { api.clear() }
++                            }
+                             purple=acceptBarAmount(bitmap,api) ?: purpleAmount(bitmap,api)
+                         }
+                     }
+@@ -60,6 +63,28 @@
+             }
+         }catch(e:java.util.concurrent.RejectedExecutionException){buffer.close();done(null)}
+     }
++    /** The order card occupies the bottom of the map. Read it in line order. */
++    private fun readOrderCard(bitmap: Bitmap, api: TessBaseAPI): String? {
++        val top = (bitmap.height * 0.622).toInt()
++        val crop = Bitmap.createBitmap(bitmap, 0, top, bitmap.width, bitmap.height - top)
++        val scale = (960.0 / crop.width).coerceIn(1.0, 1.5)
++        val card = Bitmap.createScaledBitmap(crop, (crop.width * scale).toInt(), (crop.height * scale).toInt(), true)
++        return try {
++            api.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK)
++            api.setImage(card)
++            val raw = api.getUTF8Text() ?: return null
++            val offer = OrderTextParser.parse(raw)
++            raw.takeIf {
++                api.meanConfidence() >= 55 && offer.order && offer.pickup != null && offer.destination != null
++            }
++        } finally {
++            api.clear()
++            api.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
++            if (card !== crop) card.recycle()
++            if (crop !== bitmap) crop.recycle()
++        }
++    }
++
+     // Identify saturated violet regions, then OCR only their bounded line crops.
+     // Never accept an uncoloured amount, a multiplier, or a bare priority number.
+     private fun acceptBarAmount(bitmap:Bitmap,api:TessBaseAPI):Long? {
+--- a/core-tests/LocalFareLearningCheck.kt
++++ b/core-tests/LocalFareLearningCheck.kt
+@@ -44,5 +44,20 @@
+     check(OrderTextParser.parse("Пассажир").tariff == null)
+     check(OrderTextParser.parse(ev.replace("Пассажир", "Позвонить пассажиру")).tariff == null)
+     check(TarifCatalog.forName(detectedEv.tariff)?.let { FareEngine.base(it, RouteEstimate(3.0, 7.0)) } == 1_005.0)
+-    println("23 local learning, visible fare and EV recognition checks passed")
++    // The two observed shapes: separate native nodes and a line with a circled letter from OCR.
++    val orderCard = "600 м · 3 мин\nБлижняя подача Комфорт+\n(А) проспект Тестовый, 28Ак14\n(Б) Торговая Галерея, Выход А — Первомайская\nПассажир ★ 4.89\n+1 Принять х1.00"
++    val card = OrderTextParser.parse(orderCard)
++    check(card.order && card.tariff == "Комфорт+")
++    check(card.pickup == "проспект Тестовый, 28Ак14")
++    check(card.destination == "Торговая Галерея, Выход А — Первомайская")
++    check(card.pickupKm == 0.6 && card.pickupMin == 3)
++    check(card.demand?.type == DemandType.NONE && card.demand.verified && card.displayedGross == null)
++    val noMarkers = OrderTextParser.parse(orderCard.replace("(А) ", "").replace("(Б) ", ""))
++    check(noMarkers.pickup == card.pickup && noMarkers.destination == card.destination)
++    val splitNative = OrderTextParser.parse(orderCard.replace("(А) ", "А\n").replace("(Б) ", "Б\n").replace("Принять х1.00", "Принять\n×1.00"))
++    check(splitNative.pickup == card.pickup && splitNative.destination == card.destination && splitNative.demand?.verified == true)
++    check(OrderTextParser.parse(orderCard.replace("х1.00", "х1.50")).demand == null)
++    val estimate = RouteFareEstimator.calculate(TarifCatalog.forName(card.tariff)!!, OfflineRoute(3.0, 7.0, "test"), card.demand!!, 19.2, 1.0)
++    check(estimate.gross == 917.0 && abs(estimate.net!! - 731.766) < 0.00001)
++    println("32 calculator, EV and incoming card checks passed")
+ }
