@@ -1,0 +1,340 @@
+--- a/app/src/main/java/kz/taxiprofitai/AlmatyLookupKey.kt
++++ b/app/src/main/java/kz/taxiprofitai/AlmatyLookupKey.kt
+@@ -12,6 +12,7 @@
+     private val city = Regex("""(?iu)(?:^Алматы\s*,\s*|\s*,\s*(?:город\s+)?Алматы(?:\s*,\s*Казахстан)?\s*$)""")
+ 
+     private val nazarbayev = Regex("""^(?:имени нурсултана )?назарбаева (?=\d)""")
++    private val nauryzbay = Regex("""^наурызбай батыра (?=\d)""")
+     private val latin = mapOf(
+         'а' to "a", 'б' to "b", 'в' to "v", 'г' to "g", 'д' to "d", 'е' to "e", 'ж' to "zh",
+         'з' to "z", 'и' to "i", 'й' to "y", 'к' to "k", 'л' to "l", 'м' to "m", 'н' to "n",
+@@ -24,7 +25,7 @@
+ 
+     fun candidates(raw: String, address: Boolean): List<String> {
+         val native = normalize(raw, address)
+-        val alternate = if (address) native.replace(nazarbayev, "назарбаев ")
++        val alternate = if (address) native.replace(nazarbayev, "назарбаев ").replace(nauryzbay, "наурызбай батыр ")
+             else native.map { latin[it] ?: it.toString() }.joinToString("")
+         return listOf(native, alternate).distinct().filter { it.length >= 3 }
+     }
+--- a/app/src/main/java/kz/taxiprofitai/Engine.kt
++++ b/app/src/main/java/kz/taxiprofitai/Engine.kt
+@@ -271,8 +271,21 @@
+     }
+ 
+     fun samePoint(known: String, candidate: String): Boolean {
+-        val left = AlmatyLookupKey.normalize(known, true)
+-        return left.isNotBlank() && left == AlmatyLookupKey.normalize(candidate, true)
++        fun keys(point: String) = AlmatyLookupKey.candidates(PlaceLookup.streetAddress(point) ?: point, address = true)
++        return keys(known).any(keys(candidate)::contains)
++    }
++
++    fun parseQueuedOffer(text: String): Detected? {
++        val rows = text.lines()
++        val accept = rows.indexOfLast { it.contains("Принять", true) }
++        if (accept < 0) return null
++        val preceding = rows.take(accept)
++        val header = preceding.indexOfLast { pickup.containsMatchIn(it) }
++            .takeIf { it >= 0 } ?: preceding.indexOfLast { cardHeader.containsMatchIn(it.trim()) }
++        if (header < 0) return null
++        val buttonExtra = rows.getOrNull(accept + 1)?.takeIf { standaloneCoefficient.matches(it.trim()) }
++        return parse((rows.subList(header, accept + 1) + listOfNotNull(buttonExtra)).joinToString("\n"), cardOnly = true)
++            .takeIf { it.order }
+     }
+ 
+     fun parse(text: String, cardOnly: Boolean = false): Detected {
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupState.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupState.kt
+@@ -49,6 +49,12 @@
+         private set
+ 
+     fun accept(stableIdentity: String?, place: String?) {
++        val different = when {
++            identity != null && stableIdentity != null -> identity != stableIdentity
++            destination != null && place != null -> !OrderTextParser.samePoint(destination!!, place)
++            else -> false
++        }
++        if (different) clear()
+         accepted = true
+         if (identity == null) identity = stableIdentity
+         if (destination == null) destination = place
+@@ -61,7 +67,6 @@
+         val target = destination
+         val different = if (known != null) stableIdentity != known
+             else target == null || (place != null && !OrderTextParser.samePoint(target, place))
+-        if (different) clear()
+         return different
+     }
+ 
+--- a/app/src/main/java/kz/taxiprofitai/OfflineAlmatyIndex.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfflineAlmatyIndex.kt
+@@ -21,7 +21,9 @@
+         val path = indexFile() ?: return null
+         open(path).use { db ->
+             for (kind in listOf(0, 1)) {
+-                for (key in AlmatyLookupKey.candidates(name, address = kind == 0)) {
++                val candidates = if (kind == 0) queries.flatMap { AlmatyLookupKey.candidates(it, address = true) }.distinct()
++                    else AlmatyLookupKey.candidates(name, address = false)
++                for (key in candidates) {
+                     val points = db.rawQuery(
+                         "select lat, lon from places where key = ? and kind = ? limit 80",
+                         arrayOf(key, kind.toString())
+--- a/app/src/main/java/kz/taxiprofitai/PlaceLookup.kt
++++ b/app/src/main/java/kz/taxiprofitai/PlaceLookup.kt
+@@ -5,14 +5,20 @@
+     data class Match(val lat: Double, val lon: Double, val labels: List<String>)
+ 
+     private val entrance = Regex("""(?iu)(?:,|\s+[—–-])\s*(?:выход|вход)\b.*$""")
+-    private val street = Regex("""(?iu)\b(?:улица|проспект|микрорайон|шоссе|переулок|бульвар|просп)\b|,\s*\d+\s*[А-ЯA-Z]?(?:\s*к(?:орпус)?\s*\d+)?\s*$""")
++    private val street = Regex("""(?iu)\b(?:улица|ул|проспект|микрорайон|шоссе|переулок|бульвар|просп)\b|,\s*\d+\s*[А-ЯA-Z]?(?:\s*к(?:орпус)?\s*\d+)?\s*$""")
+     private val prefix = Regex("""(?iu)^(?:кафе|кофейня|ресторан|ТРЦ|ТЦ|БЦ|ЖК|здание|магазин|отель|гостиница)\s+""")
+     private val words = Regex("""[^\p{L}\p{N}]+""")
++
++    private val addressWithVenue = Regex(
++        """(?iu)^.+?,\s*((?:улица|ул\.?|проспект|просп\.?|переулок|шоссе|бульвар)\s+[^,]+,\s*\d+[а-яa-z0-9/-]*)(?:\s*,\s*(?:город\s+)?Алматы(?:\s*,\s*Казахстан)?)?\s*$"""
++    )
++
++    fun streetAddress(raw: String): String? = addressWithVenue.matchEntire(raw.trim())?.groupValues?.get(1)
+ 
+     fun queries(raw: String): List<String> {
+         val name = raw.replace(entrance, "").trim()
+         val expanded = name.replace(Regex("""(?iu)(\d+[а-я]?)[кk](\d+[а-я]?)$"""), "$1 корпус $2")
+-        return listOf(raw, expanded, name).filter(String::isNotBlank).distinct()
++        return listOfNotNull(streetAddress(name), raw, expanded, name).filter(String::isNotBlank).distinct()
+     }
+ 
+     fun isNamedPlace(text: String): Boolean = text.isNotBlank() && !street.containsMatchIn(text)
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -78,6 +78,7 @@
+     private var detected=OrderTextParser.Detected(false,null,null,false,null,null,null,null)
+     private val offerPopupState=OfferPopupState()
+     private val acceptedFare = AcceptedFarePopupState()
++    private var showingAcceptedFare = false
+     private val acceptedFareTimeout = Runnable {
+         render()
+         Log.i("ZnayTsenuService", "Accepted fare returned to waiting")
+@@ -195,7 +196,7 @@
+         var initialY = 0
+         var moving = false
+         panel.setOnClickListener {
+-            if (acceptedFare.accepted) {
++            if (showingAcceptedFare) {
+                 acceptedFare.dismiss()
+                 ui.removeCallbacks(acceptedFareTimeout)
+             } else offerPopupState.dismiss()
+@@ -263,6 +264,7 @@
+     }
+ 
+     private fun closeOffer() {
++        showingAcceptedFare = false
+         detected=OrderTextParser.Detected(false,null,null,false,null,null,null,null)
+         verifiedIdentity=null;verifiedDemand=null;verifiedAt=0L
+         routeKey=null;estimate=null;routeStatus="";nonOrderSnapshots=0
+@@ -349,20 +351,23 @@
+         }
+         RideGpsService.record(rideTiming.active)
+         if (ridePhase == RidePhase.CANCELLED || ridePhase == RidePhase.COMPLETED) {
+-            tripProgress.clear()
++            tripProgress.finishActive()
+             acceptedFare.clear()
+             ui.removeCallbacks(acceptedFareTimeout)
+             progressEpoch++
+-            closeOffer()
+-            render()
+-            return
++            if (showingAcceptedFare) closeOffer()
+         }
+         val screen = OrderTextParser.parse(visible)
++        val phase = TripProgressReader.read(visible, selectedRoutes.singleOrNull())
++        val inTrip = ridePhase == RidePhase.ACTIVE || phase?.selecting == false
+         val isolatedCard = card
+         val native = when {
+-            isolatedCard == null -> screen
+-            screen.order -> screen.copy(pickup = isolatedCard.pickup, destination = isolatedCard.destination)
+-            else -> isolatedCard
++            inTrip && screen.order -> isolatedCard
++                ?: OrderTextParser.parseQueuedOffer(visible)
++                ?: screen.copy(order = false)
++            isolatedCard != null && screen.order -> screen.copy(
++                pickup = isolatedCard.pickup, destination = isolatedCard.destination)
++            else -> isolatedCard ?: screen
+         }
+         currentNativeOffer = native
+         currentNativeText = visible
+@@ -372,19 +377,24 @@
+         val identity = OfferPopupState.identity(current.pickup, current.destination, current.tariff)
+         if (latestBadge?.first != identity) latestBadge = null
+         val newer = current.copy(tripBadge = native.tripBadge ?: current.tripBadge ?: latestBadge?.second)
+-        val phase = TripProgressReader.read(visible, selectedRoutes.singleOrNull())
+         if (!newer.order || !acceptedFare.allowsIncoming(identity, newer.destination)) {
+-            if ((ridePhase == RidePhase.READY || ridePhase == RidePhase.ACTIVE) &&
+-                (loggedIdentity != null || destinations.size == 1 || tripProgress.hasContext(now))) {
+-                beginAccepted(loggedIdentity, destinations.singleOrNull())
+-            }
+-            if (phase != null) handleTripProgress(phase)
++            if (phase != null && ridePhase != RidePhase.COMPLETED && ridePhase != RidePhase.CANCELLED) {
++                handleTripProgress(phase)
++            }
++            if (!acceptedFare.accepted && (ridePhase == RidePhase.READY || ridePhase == RidePhase.ACTIVE) &&
++                tripProgress.hasContext(now)) {
++                val destination = destinations.singleOrNull()
++                val offerMatches = destination != null &&
++                    detected.destination?.let { OrderTextParser.samePoint(it, destination) } == true
++                if (offerMatches) beginAccepted(loggedIdentity, destination)
++            }
+             if ((acceptedFare.needsPrice() || (!acceptedFare.accepted && tripProgress.hasContext(now))) &&
+                 (phase == null || phase.gross == null)) {
+                 tryOcr(root.windowId, ++scanGeneration, now, visible, native, badgeOnly = false, progressOnly = true)
+             }
+             if (acceptedFare.accepted) {
+-                render()
++                if (!showingAcceptedFare) processDetection(newer.copy(order = false), windowChanged)
++                else render()
+                 return
+             }
+         }
+@@ -505,10 +515,10 @@
+ 
+     private fun handleTripProgress(progress: TripProgress) {
+         val quote = tripProgress.update(progress, System.currentTimeMillis())
+-        if (progress.selecting && quote == null) return
+-        val identity = quote?.let { OfferPopupState.identity(it.pickup, it.destination, it.tariff) }
+-        beginAccepted(identity ?: loggedIdentity, quote?.destination ?: progress.destination)
+-        if (progress.selecting || progress.gross == null || quote == null) return
++        if (quote == null) return
++        val identity = OfferPopupState.identity(quote.pickup, quote.destination, quote.tariff)
++        beginAccepted(identity, quote.destination)
++        if (progress.selecting || progress.gross == null) return
+         if (!acceptedFare.showOnce(android.os.SystemClock.elapsedRealtime())) return
+         processDetection(quote, false, rememberIncoming = false)
+         Log.i("ZnayTsenuService", "Accepted fare opened once")
+@@ -523,6 +533,7 @@
+             if (rememberIncoming && !acceptedFare.allowsIncoming(
+                     OfferPopupState.identity(newer.pickup, newer.destination, newer.tariff), newer.destination
+                 )) return
++            showingAcceptedFare = !rememberIncoming
+             if (rememberIncoming) {
+                 ui.removeCallbacks(acceptedFareTimeout)
+                 val now = System.currentTimeMillis()
+@@ -672,7 +683,7 @@
+ 
+     private fun render() {
+         val panel = popup ?: return
+-        val showing = if (acceptedFare.accepted) acceptedFare.isShowing(android.os.SystemClock.elapsedRealtime())
++        val showing = if (showingAcceptedFare) acceptedFare.isShowing(android.os.SystemClock.elapsedRealtime())
+             else offerPopupState.shouldShow()
+         if (detected.order && showing) {
+             val baseDemand = detected.demand
+--- a/app/src/main/java/kz/taxiprofitai/TripProgress.kt
++++ b/app/src/main/java/kz/taxiprofitai/TripProgress.kt
+@@ -80,8 +80,8 @@
+ 
+     fun remember(offer: OrderTextParser.Detected, now: Long) {
+         val prior = incoming
+-        if (prior?.destination != offer.destination || prior?.pickup != offer.pickup || prior?.tariff != offer.tariff || active != null) {
+-            clear()
++        if (prior?.destination != offer.destination || prior?.pickup != offer.pickup || prior?.tariff != offer.tariff) {
++            selected = null
+         }
+         incoming = offer
+         seenAt = now
+@@ -96,35 +96,42 @@
+             return offer.copy(tripBadge = selected ?: offer.tripBadge)
+         }
+         val match = progress.destination
+-        val linked = (active ?: prior)?.takeIf { known ->
++        fun matches(known: OrderTextParser.Detected) =
+             match != null && known.destination?.let { OrderTextParser.samePoint(it, match) } == true &&
+                 (progress.tariff == null || progress.tariff == known.tariff)
+-        }
+-        val last = active
+-        if (linked == null && (progress.gross == null || progress.tariff == null)) return null
+-        if (linked == null) {
+-            active = null
+-            activeAt = null
++        val last = active?.takeIf(::matches)
++        val next = prior?.takeIf(::matches).takeIf { last == null }
++        val linked = last ?: next
++        if (linked == null && (active != null || prior?.destination != null ||
++                progress.gross == null || progress.tariff == null)) return null
++        if (last == null) activeAt = null
++        val selectedForTrip = selected.takeIf { next != null }
++        if (next != null) {
++            incoming = null
+             selected = null
+         }
+         val started = activeAt ?: now.also { activeAt = it }
+-        val chosen = selected ?: linked?.tripBadge
++        val chosen = selectedForTrip ?: linked?.tripBadge
+         val earlyNav = progress.route?.takeIf { now - started in 0L..60_000L &&
+             (chosen == null || it.km in chosen.km * 0.90..chosen.km * 1.12) }
+         val actualPrice = progress.gross ?: linked?.displayedGross?.takeIf { last != null }
+         val quote = (linked ?: OrderTextParser.Detected(
+             true, progress.tariff, null, false, null, match, null, null
+         )).copy(displayedGross = actualPrice,
+-            tripBadge = earlyNav ?: last?.tripBadge?.takeIf { linked != null } ?: selected ?: linked?.tripBadge)
++            tripBadge = earlyNav ?: last?.tripBadge ?: chosen)
+         active = quote
+         return quote
+     }
+ 
++    fun finishActive() {
++        active = null
++        activeAt = null
++    }
++
+     fun clear() {
++        finishActive()
+         incoming = null
+         selected = null
+-        active = null
+-        activeAt = null
+         seenAt = 0L
+     }
+ }
+--- a/core-tests/OfferPopupCheck.kt
++++ b/core-tests/OfferPopupCheck.kt
+@@ -40,6 +40,8 @@
+     ok(!accepted.isShowing(6000), "returns to waiting at the deadline")
+     ok(!accepted.showOnce(7000), "same trip stays collapsed")
+     ok(accepted.allowsIncoming(b, "Жандосова, 2"), "new offer can be displayed")
++    accepted.accept(a, "Аэропорт Алматы")
++    ok(!accepted.showOnce(7500), "queued offer does not reopen current trip fare")
+     accepted.accept(b, "Жандосова, 2")
+     ok(accepted.showOnce(8000), "new trip gets its own one-time display")
+     accepted.dismiss()
+--- a/core-tests/TripProgressCheck.kt
++++ b/core-tests/TripProgressCheck.kt
+@@ -32,6 +32,31 @@
+     state.clear()
+     check(state.update(firstNav, 564_000) == null)
+     check(state.update(price, 565_000)?.pickup == null)
++    val first = OrderTextParser.parse("20 м · 1 мин\nБлижняя подача\nКомфорт+\n" +
++        "А улица Манаса, 22Д\nБ Каблан, ул. Наурызбай батыра, 154, Алматы\nПассажир\nПринять ×1.00")
++    val firstPrice = price.copy(gross = 910.0, destination = "ул. Наурызбай батыра, 154")
++    val combined = "Б Каблан, ул. Наурызбай батыра, 154, Алматы\nКомфорт+\n" +
++        "Оплата картой 910 ₸\nСтоимость поездки с учетом пробок\nЗавершить\n" +
++        "30 м · 1 мин\nБлижняя подача\nКомфорт+\nА улица Наурызбай батыра, 156\n" +
++        "Б улица Пирогова, 32\nПассажир\nПринять +50 ₸"
++    val second = OrderTextParser.parseQueuedOffer(combined)!!
++    check(second.destination == "улица Пирогова, 32" && second.displayedGross == null)
++    check(AlmatyLookupKey.candidates(PlaceLookup.queries(first.destination!!).first(), true)
++        .contains("наурызбай батыр 154"))
++    val secondPrice = price.copy(gross = 940.0, destination = "улица Пирогова, 32")
++    state.clear()
++    state.remember(first, 600_000)
++    check(state.update(firstPrice, 601_000)?.pickup == first.pickup)
++    state.remember(second, 602_000)
++    check(state.update(firstPrice, 603_000)?.pickup == first.pickup)
++    state.finishActive()
++    check(state.update(firstPrice, 604_000) == null)
++    check(state.update(secondPrice, 605_000)?.pickup == second.pickup)
++    state.clear()
++    state.remember(first, 606_000)
++    check(state.update(firstPrice, 607_000)?.pickup == first.pickup)
++    state.remember(second, 608_000)
++    check(state.update(secondPrice, 609_000)?.pickup == second.pickup)
+     val net = CommissionCatalog.calculate(4090.0, 4090.0, 19.2, 1.0).net!!
+     check(abs(net - 3263.82) < 0.01)
+     println("Incoming, selected route, remaining ETA, and displayed in-trip price verified")
