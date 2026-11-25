@@ -1,0 +1,493 @@
+--- a/app/src/main/java/kz/taxiprofitai/Engine.kt
++++ b/app/src/main/java/kz/taxiprofitai/Engine.kt
+@@ -146,7 +146,8 @@
+     data class Detected(val order: Boolean, val tariff: String?, val demand: Demand?, val airport: Boolean,
+                         val pickup: String?, val destination: String?, val pickupKm: Double?, val pickupMin: Int?,
+                         val verifiedHighDemandDiscount: Boolean = false, val displayedGross: Double? = null,
+-                        val pickupExtra: Long? = null, val observedCoefficient: Double? = null)
++                        val pickupExtra: Long? = null, val observedCoefficient: Double? = null,
++                        val tripBadge: TripBadge? = null)
+     private val fixed = Regex("\\+\\s*(\\d[\\d\\s]*)\\s*[₸Т](?!\\w)", RegexOption.IGNORE_CASE)
+     private val mult = Regex("[×xх]\\s*(\\d+[,.]\\d+)", RegexOption.IGNORE_CASE)
+     private val pickup = Regex("""(?iu)(\d+(?:[,.]\d+)?)\s*(км|м)\s*[·•.\-]\s*(\d+)\s*мин""")
+@@ -217,7 +218,7 @@
+ 
+     private fun isRouteLine(line: String): Boolean = line.length in 3..160 && line.any(Char::isLetter) &&
+         !offerMetadata.containsMatchIn(line) && !driverLocation.containsMatchIn(line) &&
+-        !unavailable.containsMatchIn(line) && !mapCoordinate.matches(line) && !displayedFare.matches(line) && !pickupMoney.matches(line) &&
++        !unavailable.containsMatchIn(line) && !TripBadgeReader.isMeasurement(line) && !mapCoordinate.matches(line) && !displayedFare.matches(line) && !pickupMoney.matches(line) &&
+         pointLine(line) == null && TarifCatalog.titles.none { it.equals(line, true) }
+ 
+     private fun routePoints(lines: List<String>, cardOnly: Boolean): Pair<String?, String?> {
+@@ -317,7 +318,8 @@
+             approachKm, pm?.groupValues?.get(3)?.toIntOrNull(),
+             t.contains("Очень высокий спрос",true) && t.contains("Комиссия снижена",true),
+             if (isOrder && tariff != null) visibleFare(addresses) else null,
+-            pickupFees.map { it.second }.distinct().singleOrNull(), visibleCoefficient)
++            pickupFees.map { it.second }.distinct().singleOrNull(), visibleCoefficient,
++            if (isOrder && !cardOnly) TripBadgeReader.read(t) else null)
+     }
+ }
+ 
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
+@@ -102,7 +102,7 @@
+             status.startsWith("Нет маршрута") -> "Нет маршрута BRouter"
+             status.startsWith("Маршрут") -> "Считаем…"
+             status == "Учтён опыт поездок" || status == "Время скорректировано" -> status
+-            status == "База комиссии неизвестна" -> status
++            status == "База комиссии неизвестна" || status == "Время Яндекс Про" -> status
+             ratesExpired && estimate != null && !estimate.fromOrder -> "Исторические ставки"
+             else -> "Нажмите, чтобы свернуть"
+         }
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -36,6 +36,8 @@
+     private var ocr: WindowOcr?=null
+     private var scanGeneration=0L
+     private data class OcrOrder(val windowId: Int, val visible: String, val order: OrderTextParser.Detected)
++    private var currentNativeOffer: OrderTextParser.Detected? = null
++    private var latestBadge: Pair<String, TripBadge>? = null
+     private var currentNativeText = ""
+     private var currentNativeWindow = -1
+     private var cachedOcrOrder: OcrOrder? = null
+@@ -117,6 +119,9 @@
+         lastScan = 0
+         // Wait for the system to finish binding the service and assigning its overlay token.
+         scheduleScan(200L)
++        if (android.os.Build.VERSION.SDK_INT >= 34 && prefs.getBoolean("ocr_allowed", false)) {
++            WindowOcr(this).also { ocr = it }.prepare()
++        }
+     }
+ 
+     private fun stopShift() {
+@@ -226,6 +231,8 @@
+         routeKey=null;estimate=null;routeStatus="";nonOrderSnapshots=0
+         routeGeneration++
+         cachedOcrOrder = null
++        latestBadge = null
++        currentNativeOffer = null
+         loggedOffer = false
+         loggedIdentity = null
+         offerPopupState.clear()
+@@ -300,21 +307,30 @@
+             screen.order -> screen.copy(pickup = isolatedCard.pickup, destination = isolatedCard.destination)
+             else -> isolatedCard
+         }
++        currentNativeOffer = native
+         currentNativeText = visible
+         currentNativeWindow = root.windowId
+         if (windowChanged) cachedOcrOrder = null
+-        val newer = cachedOcrOrder?.takeIf { it.windowId == root.windowId && it.visible == visible }?.order ?: native
++        val current = cachedOcrOrder?.takeIf { it.windowId == root.windowId && it.visible == visible }?.order ?: native
++        val identity = OfferPopupState.identity(current.pickup, current.destination, current.tariff)
++        if (latestBadge?.first != identity) latestBadge = null
++        val newer = current.copy(tripBadge = native.tripBadge ?: current.tripBadge ?: latestBadge?.second)
+         val generation=++scanGeneration
+         val incomplete = newer.tariff == null || (newer.displayedGross == null &&
+             (newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank() || newer.demand == null))
+         val hint=visible.isBlank() || newer.order || visible.contains("Принять",true) || visible.contains("Пропустить",true)
+-        if(hint && (!newer.order || incomplete))tryOcr(root.windowId,generation,now,visible,native)
+-        val identity=OfferPopupState.identity(newer.pickup,newer.destination,newer.tariff)
++        val lookForBadge = newer.order && newer.displayedGross == null && newer.tripBadge == null
++        if (hint && (!newer.order || incomplete || lookForBadge)) {
++            tryOcr(root.windowId, generation, now, visible, native, badgeOnly = lookForBadge && !incomplete)
++        }
+         val reuse=if(newer.order && !windowChanged && identity!=null && identity==verifiedIdentity && now-verifiedAt in 0L..3000L)verifiedDemand else null
+         if(windowChanged || (newer.order && identity!=verifiedIdentity)){verifiedIdentity=null;verifiedDemand=null;verifiedAt=0L}
+         processDetection(newer.copy(demand=newer.demand ?: reuse),windowChanged)
+     }
+-    private fun tryOcr(windowId:Int,generation:Long,now:Long,visible:String,original:OrderTextParser.Detected){
++    private fun tryOcr(
++        windowId:Int, generation:Long, now:Long, visible:String,
++        original:OrderTextParser.Detected, badgeOnly:Boolean
++    ){
+         if(android.os.Build.VERSION.SDK_INT<34 || !prefs.getBoolean("ocr_allowed",false))return
+         if(ocrBusy || now-lastOcr<1800L)return
+         val worker = ocr ?: WindowOcr(this).also { ocr = it }
+@@ -324,7 +340,7 @@
+             takeScreenshotOfWindow(windowId,mainExecutor,object:TakeScreenshotCallback{
+                 override fun onSuccess(result:ScreenshotResult){
+                     if(!running || epoch!=ocrEpoch){result.hardwareBuffer.close();return}
+-                    worker.recognize(result){reading->
++                    worker.recognize(result, badgeOnly){reading->
+                         ui.post {
+                             if(epoch!=ocrEpoch)return@post
+                             ocrBusy=false
+@@ -332,7 +348,17 @@
+                             val active=rootInActiveWindow
+                             if(active?.packageName?.toString()!="ru.yandex.taximeter" || active.windowId!=windowId)return@post
+                             if(System.currentTimeMillis()-now>5000L)return@post
+-                            if (currentNativeWindow != windowId || currentNativeText != visible) return@post
++                            if (currentNativeWindow != windowId) return@post
++                            val freshest = currentNativeOffer
++                            val originalId = OfferPopupState.identity(original.pickup, original.destination, original.tariff)
++                            val currentId = freshest?.let { OfferPopupState.identity(it.pickup, it.destination, it.tariff) }
++                            val badge = reading.badge
++                            if (badge != null && freshest?.order == true && originalId != null && originalId == currentId) {
++                                latestBadge = originalId to badge
++                                processDetection(detected.takeIf { it.order }?.copy(tripBadge = freshest.tripBadge ?: badge)
++                                    ?: freshest.copy(tripBadge = freshest.tripBadge ?: badge), false)
++                            }
++                            if (badgeOnly || currentNativeText != visible) return@post
+                             if (scanGeneration != generation && !detected.order) return@post
+                             val recognized = OrderTextParser.parse(reading.text.orEmpty(), cardOnly = reading.cardOnly)
+                             val candidate = if (reading.cardOnly) recognized
+@@ -347,12 +373,13 @@
+                                 tariff = original.tariff ?: candidate.tariff,
+                                 displayedGross = original.displayedGross ?: candidate.displayedGross.takeIf { candidate.order },
+                                 pickupExtra = original.pickupExtra ?: candidate.pickupExtra.takeIf { candidate.order },
+-                                observedCoefficient = original.observedCoefficient ?: candidate.observedCoefficient.takeIf { candidate.order }
+-                            ) else candidate
++                                observedCoefficient = original.observedCoefficient ?: candidate.observedCoefficient.takeIf { candidate.order },
++                                tripBadge = original.tripBadge ?: candidate.tripBadge ?: badge
++                            ) else candidate.copy(tripBadge = candidate.tripBadge ?: badge)
+                             val purple = reading.purple?.takeUnless { it == merged.pickupExtra }
+                             val demand=OfferDemandEvidence.merge(original.demand ?: candidate.demand,purple)
+                             if (!merged.order || merged.tariff == null || (demand == null && merged.displayedGross == null &&
+-                                    (merged.pickup == null || merged.destination == null))) return@post
++                                    (merged.tripBadge == null && (merged.pickup == null || merged.destination == null)))) return@post
+                             if(original.tariff!=null && original.tariff!=merged.tariff)return@post
+                             if(original.pickup!=null && original.pickup!=merged.pickup)return@post
+                             if(original.destination!=null && original.destination!=merged.destination)return@post
+@@ -385,7 +412,7 @@
+             offerPopupState.observe(true, identity)
+             detected=newer
+             // Trigger once per unique visible order; do not re-geocode on each accessibility event.
+-            val key="${newer.pickup}|${newer.destination}|${newer.tariff}|${newer.demand}|${newer.displayedGross}|${newer.pickupExtra}|${newer.verifiedHighDemandDiscount}|${newer.tariff?.let{CommissionSettings.percent(prefs,it)}}|${CommissionSettings.loyalty(prefs)}|${CommissionSettings.park(prefs)}"
++            val key="${newer.pickup}|${newer.destination}|${newer.tariff}|${newer.demand}|${newer.displayedGross}|${newer.tripBadge}|${newer.pickupExtra}|${newer.verifiedHighDemandDiscount}|${newer.tariff?.let{CommissionSettings.percent(prefs,it)}}|${CommissionSettings.loyalty(prefs)}|${CommissionSettings.park(prefs)}"
+             if(key!=routeKey){
+                 routeKey=key;estimate=null
+                 val generation = ++routeGeneration
+@@ -400,6 +427,21 @@
+                     estimate = LiveFareEstimate(shown, commission?.net, 0.0, 0.0, "Цена из заказа",
+                         commission, fromOrder = true)
+                     routeStatus = if (commission == null) "База комиссии неизвестна" else "Цена из заказа"
++                } else if (newer.tripBadge != null && rate != null) {
++                    val route = newer.tripBadge.route()
++                    val demand = newer.demand ?: Demand(DemandType.NONE)
++                    estimate = RouteFareEstimator.calculateWithCommission(rate, route, demand, yandex, park,
++                        loyalty, newer.verifiedHighDemandDiscount, pickupExtras(newer))
++                    routeStatus = if (newer.demand == null) "Надбавка неизвестна" else route.source
++                    val quote = estimate
++                    val destination = newer.destination
++                    if (!loggedOffer && quote != null && identity != null && destination != null) {
++                        val elapsed = android.os.SystemClock.elapsedRealtime()
++                        val rowId = TrialStore.append(this, rate.title, quote, route.source, 0,
++                            offlineMinutes = 0.0)
++                        rideTiming.offer(rowId, destination, elapsed)
++                        loggedOffer = true
++                    }
+                 } else if (newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank() || rate == null) {
+                     routeStatus = when {
+                         newer.pickup == null && newer.destination == null -> "Не считаны адреса А и Б"
+@@ -425,8 +467,7 @@
+                             val raw = runCatching {
+                                 RouteFareEstimator.calculateWithCommission(rate, timedRoute, demand, yandex, park,
+                                     loyalty, newer.verifiedHighDemandDiscount,
+-                                    ConfirmedExtras(pickupCharge = newer.pickupExtra?.toDouble() ?: 0.0,
+-                                        paidPickupConfirmed = newer.pickupExtra != null))
++                                    pickupExtras(newer))
+                             }.getOrNull()
+                             val fixed = if (newer.pickupExtra != null) null else when (observedDemand?.type) {
+                                 DemandType.NONE -> 0.0
+@@ -487,6 +528,11 @@
+         render()
+     }
+ 
++    private fun pickupExtras(offer: OrderTextParser.Detected) = ConfirmedExtras(
++        pickupCharge = offer.pickupExtra?.toDouble() ?: 0.0,
++        paidPickupConfirmed = offer.pickupExtra != null
++    )
++
+     private fun render() {
+         val panel = popup ?: return
+         if (detected.order && offerPopupState.shouldShow()) {
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/TripBadge.kt
+@@ -0,0 +1,91 @@
++package kz.taxiprofitai
++
++/** Distance and ETA from the destination badge in the order map. */
++data class TripBadge(val km: Double, val minutes: Int) {
++    fun route() = OfflineRoute(km, minutes.toDouble(), "Время Яндекс Про")
++}
++
++object TripBadgeReader {
++    private val marker = Regex("""(?iu)^\s*(?:\([БB]\)|[БB](?=[:.\s]|$))\s*[:.]?\s*(.*)$""")
++    private val metrics = Regex(
++        """(?iu)^\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*(км|km|м|m)\s*[·•,|—-]?\s*(?:(\d{1,2})\s*(?:ч|h)\.?\s*)?(?:(\d{1,3})\s*(?:мин|min)\.?)?\s*$"""
++    )
++
++    private val distanceLine = Regex("""(?iu)^\d{1,4}(?:[.,]\d{1,2})?\s*(?:км|km|м|m)$""")
++    private val measurement = Regex("""(?iu)^\d[\d.,\s·•-]*(?:км|km|м|m|ч|h|мин|min)(?:\s+\d{1,3}\s*(?:мин|min))?\.?$""")
++    fun isMeasurement(text: String): Boolean = measurement.matches(text)
++
++    fun read(text: String): TripBadge? {
++        val lines = text.replace('\u00a0', ' ').replace('\u202f', ' ').lines().map(String::trim).filter(String::isNotEmpty)
++        return lines.indices.mapNotNull { i ->
++            val own = marker.matchEntire(lines[i])?.groupValues?.get(1) ?: return@mapNotNull null
++            if (own.isBlank() && lines.getOrNull(i + 1)?.let(distanceLine::matches) != true) {
++                return@mapNotNull null
++            }
++            for (end in minOf(i + 2, lines.lastIndex) downTo i) {
++                val data = (listOf(own) + lines.subList(i + 1, end + 1)).joinToString(" ")
++                val badge = parseMetrics(data)
++                if (badge != null) return@mapNotNull badge
++            }
++            null
++        }.distinct().singleOrNull()
++    }
++
++    private fun parseMetrics(data: String): TripBadge? {
++        val match = metrics.matchEntire(data)?.groupValues ?: return null
++        val distance = match[1].replace(',', '.').toDoubleOrNull() ?: return null
++        val km = if (match[2].equals("м", true) || match[2].equals("m", true)) distance / 1000 else distance
++        val hours = match[3].toIntOrNull() ?: 0
++        val remainder = match[4].toIntOrNull() ?: 0
++        if (hours > 0 && remainder >= 60) return null
++        val total = hours * 60 + remainder
++        return TripBadge(km, total).takeIf {
++            km in 0.1..150.0 && total in 1..360 && km * 60 / total <= 145.0
++        }
++    }
++}
++
++/** Connected dark shapes in the map, filtered to the proportions of a route badge. */
++internal object TripBadgeRegions {
++    data class Box(val left: Int, val top: Int, val right: Int, val bottom: Int)
++
++    fun find(dark: BooleanArray, width: Int, height: Int): List<Box> {
++        val found = mutableListOf<Pair<Int, Box>>()
++        val queue = IntArray(dark.size)
++        fun enqueue(index: Int, tail: Int): Int {
++            if (!dark[index]) return tail
++            dark[index] = false
++            queue[tail] = index
++            return tail + 1
++        }
++        for (index in dark.indices) {
++            if (!dark[index]) continue
++            var head = 0
++            var tail = enqueue(index, 0)
++            var left = width
++            var top = height
++            var right = 0
++            var bottom = 0
++            while (head < tail) {
++                val cell = queue[head++]
++                val y = cell / width
++                val x = cell % width
++                left = minOf(left, x)
++                top = minOf(top, y)
++                right = maxOf(right, x)
++                bottom = maxOf(bottom, y)
++                if (x > 0) tail = enqueue(cell - 1, tail)
++                if (x + 1 < width) tail = enqueue(cell + 1, tail)
++                if (y > 0) tail = enqueue(cell - width, tail)
++                if (y + 1 < height) tail = enqueue(cell + width, tail)
++            }
++            val w = right - left + 1
++            val h = bottom - top + 1
++            if (w in (width * 0.21)..(width * 0.65) && h in (width * 0.055)..(width * 0.20) &&
++                w.toDouble() / h in 1.8..4.8 && tail > w * h * 0.33) {
++                found.add(tail to Box(left, top, right + 1, bottom + 1))
++            }
++        }
++        return found.sortedByDescending { it.first }.take(4).map { it.second }
++    }
++}
+--- a/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
++++ b/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
+@@ -12,11 +12,13 @@
+     private val worker=Executors.newSingleThreadExecutor()
+     @Volatile private var closed=false
+     private var tess:TessBaseAPI?=null
+-    private fun engine():TessBaseAPI {
+-        tess?.let{return it}
++    private var badgeTess:TessBaseAPI?=null
++    private fun engine(badgeOnly: Boolean = false):TessBaseAPI {
++        (if (badgeOnly) badgeTess else tess)?.let { return it }
+         val home=File(context.filesDir,"ocr-v1")
+         val data=File(home,"tessdata").apply{mkdirs()}
+-        for(lang in listOf("rus","kaz","eng")){
++        val languages = if (badgeOnly) listOf("rus") else listOf("rus", "kaz", "eng")
++        for (lang in languages){
+             val name="$lang.traineddata"
+             val target=File(data,name)
+             if(!target.exists()){
+@@ -26,13 +28,21 @@
+             }
+         }
+         val api=TessBaseAPI()
+-        if(!api.init(home.absolutePath,"rus+kaz+eng",TessBaseAPI.OEM_LSTM_ONLY)){api.recycle();error("OCR init")}
++        if(!api.init(home.absolutePath,languages.joinToString("+"),TessBaseAPI.OEM_LSTM_ONLY)){api.recycle();error("OCR init")}
+         api.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
+-        tess=api
++        if (badgeOnly) badgeTess = api else tess = api
+         return api
+     }
+-    data class Reading(val text:String?,val purple:Long?,val cardOnly:Boolean)
+-    fun recognize(result:AccessibilityService.ScreenshotResult,done:(Reading?)->Unit){
++    data class Reading(val text:String?,val purple:Long?,val cardOnly:Boolean,val badge:TripBadge?)
++    fun prepare() {
++        worker.execute {
++            if (!closed) {
++                try { engine(badgeOnly = true) } catch (_: Exception) {} catch (_: LinkageError) {}
++            }
++        }
++    }
++
++    fun recognize(result:AccessibilityService.ScreenshotResult,badgeOnly:Boolean,done:(Reading?)->Unit){
+         val buffer=result.hardwareBuffer
+         if(closed){buffer.close();done(null);return}
+         try{
+@@ -42,29 +52,95 @@
+                 var text:String?=null
+                 var purple:Long?=null
+                 var cardOnly = false
++                var badge: TripBadge? = null
+                 try{
+                     if(!closed){
+                         hw=Bitmap.wrapHardwareBuffer(buffer,result.colorSpace)
+                         bitmap=hw?.copy(Bitmap.Config.ARGB_8888,false)
+                         if(bitmap!=null && !closed){
+-                            val api=engine()
+-                            text = readOrderCard(bitmap, api)
+-                            cardOnly = text != null
+-                            if (text == null) {
+-                                api.setImage(bitmap)
+-                                try {
+-                                    val raw = api.getUTF8Text()
+-                                    if (api.meanConfidence() >= 75) text = raw
+-                                } finally { api.clear() }
++                            badge = readTripBadge(bitmap, engine(badgeOnly = true))
++                            if (!badgeOnly) {
++                                val api = engine()
++                                text = readOrderCard(bitmap, api)
++                                cardOnly = text != null
++                                if (text == null) {
++                                    api.setImage(bitmap)
++                                    try {
++                                        val raw = api.getUTF8Text()
++                                        if (api.meanConfidence() >= 75) text = raw
++                                    } finally { api.clear() }
++                                }
++                                purple=acceptBarAmount(bitmap,api) ?: purpleAmount(bitmap,api)
+                             }
+-                            purple=acceptBarAmount(bitmap,api) ?: purpleAmount(bitmap,api)
+                         }
+                     }
+                 }catch(e:Exception){}catch(e:LinkageError){}
+-                finally{bitmap?.recycle();hw?.recycle();buffer.close();done(if(closed)null else Reading(text,purple,cardOnly))}
++                finally{bitmap?.recycle();hw?.recycle();buffer.close();done(if(closed)null else Reading(text,purple,cardOnly,badge))}
+             }
+         }catch(e:java.util.concurrent.RejectedExecutionException){buffer.close();done(null)}
+     }
++    private fun readTripBadge(bitmap: Bitmap, api: TessBaseAPI): TripBadge? {
++        val step = (bitmap.width / 270).coerceAtLeast(2)
++        val width = bitmap.width / step
++        val mapTop = bitmap.height / 10
++        val height = (bitmap.height * 0.622).toInt() / step - mapTop / step
++        if (width < 70 || height < 60) return null
++        val row = IntArray(bitmap.width)
++        val dark = BooleanArray(width * height)
++        for (y in 0 until height) {
++            bitmap.getPixels(row, 0, row.size, 0, mapTop + y * step, row.size, 1)
++            for (x in 0 until width) {
++                val rgb = row[x * step]
++                dark[y * width + x] = ((rgb ushr 16) and 255) <= 36 &&
++                    ((rgb ushr 8) and 255) <= 36 && (rgb and 255) <= 36
++            }
++        }
++        return TripBadgeRegions.find(dark, width, height).mapNotNull { box ->
++            val x = box.left * step
++            val y = mapTop + box.top * step
++            val w = (box.right - box.left) * step
++            val h = (box.bottom - box.top) * step
++            val marker = readMonochrome(bitmap, api, x + (w * .09).toInt(), y + (h * .22).toInt(),
++                (w * .19).toInt(), (h * .58).toInt(), inverted = false,
++                mode = TessBaseAPI.PageSegMode.PSM_SINGLE_CHAR)?.trim()
++            if (marker != "Б" && marker != "B") return@mapNotNull null
++            val numbers = readMonochrome(bitmap, api, x + (w * .34).toInt(), y + (h * .09).toInt(),
++                (w * .63).toInt(), (h * .84).toInt(), inverted = true,
++                mode = TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK) ?: return@mapNotNull null
++            TripBadgeReader.read("Б $numbers")
++        }.distinct().singleOrNull()
++    }
++
++    private fun readMonochrome(
++        bitmap: Bitmap, api: TessBaseAPI, x: Int, y: Int, width: Int, height: Int, inverted: Boolean, mode: Int
++    ): String? {
++        val stride = width + 16
++        val pixels = IntArray(stride * (height + 16)) { android.graphics.Color.WHITE }
++        val row = IntArray(width)
++        for (dy in 0 until height) {
++            bitmap.getPixels(row, 0, width, x, y + dy, width, 1)
++            for (dx in row.indices) {
++                val light = ((row[dx] ushr 16) and 255) >= 125 &&
++                    ((row[dx] ushr 8) and 255) >= 125 && (row[dx] and 255) >= 125
++                if (light == inverted) pixels[(dy + 8) * stride + dx + 8] = android.graphics.Color.BLACK
++            }
++        }
++        val crop = Bitmap.createBitmap(pixels, stride, height + 16, Bitmap.Config.ARGB_8888)
++        val scale = if (width < 180) 3 else 2
++        val zoomed = Bitmap.createScaledBitmap(crop, crop.width * scale, crop.height * scale, false)
++        return try {
++            api.setPageSegMode(mode)
++            api.setImage(zoomed)
++            val raw = api.getUTF8Text()
++            raw?.takeIf { api.meanConfidence() >= 55 }
++        } finally {
++            api.clear()
++            api.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
++            zoomed.recycle()
++            crop.recycle()
++        }
++    }
++
+     /** The order card occupies the bottom of the map. Read it in line order. */
+     private fun readOrderCard(bitmap: Bitmap, api: TessBaseAPI): String? {
+         val top = (bitmap.height * 0.622).toInt()
+@@ -175,7 +251,12 @@
+     }
+     fun close(){
+         closed=true
+-        worker.execute{tess?.recycle();tess=null}
++        worker.execute {
++            tess?.recycle()
++            tess = null
++            badgeTess?.recycle()
++            badgeTess = null
++        }
+         worker.shutdown()
+     }
+ }
+--- /dev/null
++++ b/core-tests/TripBadgeCheck.kt
+@@ -0,0 +1,25 @@
++package kz.taxiprofitai
++
++import kotlin.math.abs
++
++fun main() {
++    val badge = TripBadge(12.0, 80)
++    val order = "Пропустить\nБ\n12 км\n1 ч 20 мин\n500 м · 4 мин\nБлижняя подача\nКомфорт+\n" +
++        "А: улица Богенбай батыра, 135\nБ: Центральная улица, 8\nПассажир\nПринять ×1.00"
++    val read = OrderTextParser.parse(order)
++    check(read.order && read.tripBadge == badge && read.pickupKm == 0.5 && read.pickupMin == 4)
++    check(read.destination == "Центральная улица, 8")
++    check(TripBadgeReader.read("Б 12 км 1ч20 мин") == badge)
++    check(TripBadgeReader.read("Б 12 км\n1 ч 20 мин") == badge)
++    check(TripBadgeReader.read("Б 900 м 4 мин") == TripBadge(0.9, 4))
++    check(TripBadgeReader.read("А 12 км 1 ч 20 мин") == null)
++    check(TripBadgeReader.read("Б\n500 м · 4 мин") == null)
++    check(TripBadgeReader.read("Б 12 км 1 ч 60 мин") == null)
++    check(TripBadgeReader.read("12 км\n1 ч 20 мин") == null)
++    check(TripBadgeReader.read("Б 12 км 20 мин\nБ 15 км 25 мин") == null)
++    check(OrderTextParser.parse(order, cardOnly = true).tripBadge == null)
++    val estimate = RouteFareEstimator.calculateWithCommission(TarifCatalog.forName(read.tariff)!!,
++        badge.route(), read.demand!!, 19.2, 1.0)
++    check(estimate.gross == 4511.0 && abs(estimate.net!! - 3599.778) < 0.001)
++    println("Destination badge, pickup exclusion, and fast route quote verified")
++}
