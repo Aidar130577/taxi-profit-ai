@@ -1,0 +1,441 @@
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
+@@ -102,7 +102,7 @@
+             status.startsWith("Нет маршрута") -> "Нет маршрута BRouter"
+             status.startsWith("Маршрут") -> "Считаем…"
+             status == "Учтён опыт поездок" || status == "Время скорректировано" -> status
+-            status == "База комиссии неизвестна" || status == "Время Яндекс Про" -> status
++            status == "База комиссии неизвестна" || status == "Время Яндекс Про" || status == "Цена Яндекс Про" -> status
+             ratesExpired && estimate != null && !estimate.fromOrder -> "Исторические ставки"
+             else -> "Нажмите, чтобы свернуть"
+         }
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -50,6 +50,8 @@
+     private var lastScan = 0L
+     private var routeGeneration = 0L
+     private val rideTiming = RideTiming()
++    private val tripProgress = TripProgressState()
++    private var progressEpoch = 0L
+     private var loggedOffer = false
+     private var loggedIdentity: String? = null
+     private var windowChangedSinceScan = false
+@@ -127,6 +129,7 @@
+     private fun stopShift() {
+         running = false
+         rideTiming.reset()
++        tripProgress.clear()
+         RideGpsService.stop(this)
+         cancelScan()
+         windowChangedSinceScan = false
+@@ -278,12 +281,17 @@
+         val lowerHalf = rootBounds.top + rootBounds.height() * 2 / 5
+         val nearBottom = rootBounds.top + rootBounds.height() * 3 / 4
+         var card: OrderTextParser.Detected? = null
++        val selectedRoutes = mutableSetOf<TripBadge>()
+         fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+             if (node == null || depth > 22 || texts.size >= 200) return
+             val start = texts.size
+             node.text?.toString()?.takeIf(String::isNotBlank)?.let(texts::add)
+             node.contentDescription?.toString()?.takeIf(String::isNotBlank)?.let(texts::add)
+             for (index in 0 until node.childCount) walk(node.getChild(index), depth + 1)
++            if ((node.isChecked || node.isSelected) && texts.size > start) {
++                val selectedRow = texts.subList(start, texts.size).distinct().joinToString(" ")
++                TripBadgeReader.parseMetrics(selectedRow)?.let(selectedRoutes::add)
++            }
+             if (depth > 0 && card == null && texts.size - start >= 3 && rootBounds.height() > 0) {
+                 val bounds = Rect().also(node::getBoundsInScreen)
+                 if (bounds.top >= lowerHalf && bounds.bottom >= nearBottom) {
+@@ -300,6 +308,13 @@
+                 km = RideGpsService.distanceKm(fact.minutes), automatic = true)
+         }
+         RideGpsService.record(rideTiming.active)
++        if (ridePhase == RidePhase.CANCELLED || ridePhase == RidePhase.COMPLETED) {
++            tripProgress.clear()
++            progressEpoch++
++            closeOffer()
++            render()
++            return
++        }
+         val screen = OrderTextParser.parse(visible)
+         val isolatedCard = card
+         val native = when {
+@@ -315,6 +330,15 @@
+         val identity = OfferPopupState.identity(current.pickup, current.destination, current.tariff)
+         if (latestBadge?.first != identity) latestBadge = null
+         val newer = current.copy(tripBadge = native.tripBadge ?: current.tripBadge ?: latestBadge?.second)
++        val phase = TripProgressReader.read(visible, selectedRoutes.singleOrNull())
++        if (!newer.order && (phase != null || tripProgress.hasContext(now))) {
++            val savedQuote = phase?.let { tripProgress.update(it, now) }
++            if (savedQuote != null) processDetection(savedQuote, false, rememberIncoming = false)
++            if (phase == null || (phase.selecting && phase.route == null) || (!phase.selecting && phase.gross == null)) {
++                tryOcr(root.windowId, ++scanGeneration, now, visible, native, badgeOnly = false, progressOnly = true)
++            }
++            if (savedQuote != null || phase != null) return
++        }
+         val generation=++scanGeneration
+         val incomplete = newer.tariff == null || (newer.displayedGross == null &&
+             (newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank() || newer.demand == null))
+@@ -329,18 +353,19 @@
+     }
+     private fun tryOcr(
+         windowId:Int, generation:Long, now:Long, visible:String,
+-        original:OrderTextParser.Detected, badgeOnly:Boolean
++        original:OrderTextParser.Detected, badgeOnly:Boolean, progressOnly:Boolean = false
+     ){
+         if(android.os.Build.VERSION.SDK_INT<34 || !prefs.getBoolean("ocr_allowed",false))return
+         if(ocrBusy || now-lastOcr<1800L)return
+         val worker = ocr ?: WindowOcr(this).also { ocr = it }
+         ocrBusy=true;lastOcr=now
+         val epoch=ocrEpoch
++        val progressGeneration = progressEpoch
+         try{
+             takeScreenshotOfWindow(windowId,mainExecutor,object:TakeScreenshotCallback{
+                 override fun onSuccess(result:ScreenshotResult){
+                     if(!running || epoch!=ocrEpoch){result.hardwareBuffer.close();return}
+-                    worker.recognize(result, badgeOnly){reading->
++                    worker.recognize(result, badgeOnly, progressOnly){reading->
+                         ui.post {
+                             if(epoch!=ocrEpoch)return@post
+                             ocrBusy=false
+@@ -349,6 +374,15 @@
+                             if(active?.packageName?.toString()!="ru.yandex.taximeter" || active.windowId!=windowId)return@post
+                             if(System.currentTimeMillis()-now>5000L)return@post
+                             if (currentNativeWindow != windowId) return@post
++                            if (progressOnly) {
++                                if (progressGeneration == progressEpoch && currentNativeOffer?.order != true &&
++                                    (currentNativeText == visible || TripProgressReader.read(currentNativeText) != null)) {
++                                    reading.progress?.let { tripProgress.update(it, System.currentTimeMillis()) }?.let {
++                                        processDetection(it, false, rememberIncoming = false)
++                                    }
++                                }
++                                return@post
++                            }
+                             val freshest = currentNativeOffer
+                             val originalId = OfferPopupState.identity(original.pickup, original.destination, original.tariff)
+                             val currentId = freshest?.let { OfferPopupState.identity(it.pickup, it.destination, it.tariff) }
+@@ -401,8 +435,15 @@
+             })
+         }catch(e:Exception){ocrBusy=false}
+     }
+-    private fun processDetection(newer:OrderTextParser.Detected,windowChanged:Boolean){
++    private fun processDetection(
++        newer: OrderTextParser.Detected, windowChanged: Boolean, rememberIncoming: Boolean = true
++    ){
+         if(newer.order) {
++            if (rememberIncoming) {
++                val now = System.currentTimeMillis()
++                tripProgress.remember(newer, now)
++                progressEpoch++
++            }
+             nonOrderSnapshots=0
+             val identity = OfferPopupState.identity(newer.pickup, newer.destination, newer.tariff)
+             if (identity != null && identity != loggedIdentity) {
+@@ -424,9 +465,10 @@
+                 if (shown != null) {
+                     val commission = if (newer.verifiedHighDemandDiscount) null
+                         else CommissionCatalog.calculate(shown, shown, yandex, park, loyalty)
+-                    estimate = LiveFareEstimate(shown, commission?.net, 0.0, 0.0, "Цена из заказа",
++                    estimate = LiveFareEstimate(shown, commission?.net, 0.0, 0.0, if (rememberIncoming) "Цена из заказа" else "Цена Яндекс Про",
+                         commission, fromOrder = true)
+-                    routeStatus = if (commission == null) "База комиссии неизвестна" else "Цена из заказа"
++                    routeStatus = if (commission == null) "База комиссии неизвестна"
++                        else if (rememberIncoming) "Цена из заказа" else "Цена Яндекс Про"
+                 } else if (newer.tripBadge != null && rate != null) {
+                     val route = newer.tripBadge.route()
+                     val demand = newer.demand ?: Demand(DemandType.NONE)
+--- a/app/src/main/java/kz/taxiprofitai/TripBadge.kt
++++ b/app/src/main/java/kz/taxiprofitai/TripBadge.kt
+@@ -8,7 +8,7 @@
+ object TripBadgeReader {
+     private val marker = Regex("""(?iu)^\s*(?:\([БB]\)|[БB](?=[:.\s]|$))\s*[:.]?\s*(.*)$""")
+     private val metrics = Regex(
+-        """(?iu)^\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*(км|km|м|m)\s*[·•,|—-]?\s*(?:(\d{1,2})\s*(?:ч|h)\.?\s*)?(?:(\d{1,3})\s*(?:мин|min)\.?)?\s*$"""
++        """(?iu)^\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*(км|km|м|m)\s*[·•.,|—-]?\s*(?:(\d{1,2})\s*(?:ч|h)\.?\s*)?(?:(\d{1,3})\s*(?:мин|min)\.?)?\s*$"""
+     )
+ 
+     private val distanceLine = Regex("""(?iu)^\d{1,4}(?:[.,]\d{1,2})?\s*(?:км|km|м|m)$""")
+@@ -31,7 +31,7 @@
+         }.distinct().singleOrNull()
+     }
+ 
+-    private fun parseMetrics(data: String): TripBadge? {
++    fun parseMetrics(data: String): TripBadge? {
+         val match = metrics.matchEntire(data)?.groupValues ?: return null
+         val distance = match[1].replace(',', '.').toDoubleOrNull() ?: return null
+         val km = if (match[2].equals("м", true) || match[2].equals("m", true)) distance / 1000 else distance
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/TripProgress.kt
+@@ -0,0 +1,130 @@
++package kz.taxiprofitai
++
++/** Visible stages after the driver has accepted an offer. */
++data class TripProgress(
++    val selecting: Boolean, val route: TripBadge?, val gross: Double?, val destination: String?, val tariff: String?
++)
++
++object TripProgressReader {
++    private val selectTitle = Regex("""(?iu)^укажите\s+маршрут\b""")
++    private val go = Regex("""(?iu)^поехали\b""")
++    private val finish = Regex("""(?iu)^(?:[^\p{L}\d]*|[0-9]+\s+)завершить(?:\s+поездку)?\s*$""")
++    private val amountCaption = Regex("""(?iu)стоимость\s+поездки\s+с\s+уч[её]том\s+пробок""")
++    private val amount = Regex("""(?iu)(?<![\d.,+])(?<!от\s)(\d{1,3}(?:\s\d{3})+|\d{1,6})\s*(?:₸|тг\.?|тенге|[тt])\s*$""")
++    private val pay = Regex("""(?iu)оплата\s+(?:картой|наличными)""")
++    private val destinationRow = Regex("""(?iu)^\s*(?:\([БB5]\)|[БB](?=\s|[:.]|$))\s*[:.]?\s*(.+)$""")
++    private val bareDestination = Regex("""(?iu)^\(?[БB]\)?[:.]?$""")
++    private val clockSuffix = Regex("""\s+\d{1,2}:\d{2}(?:\s+[^\p{L}\d])?\s*$""")
++
++    fun selecting(text: String): Boolean {
++        val lines = rows(text)
++        return lines.any(selectTitle::containsMatchIn) && (lines.any(go::containsMatchIn) ||
++            lines.count { TripBadgeReader.parseMetrics(it) != null } >= 2)
++    }
++
++    fun read(text: String, selected: TripBadge? = null): TripProgress? {
++        val lines = rows(text)
++        if (lines.any(selectTitle::containsMatchIn) && (lines.any(go::containsMatchIn) ||
++                lines.count { TripBadgeReader.parseMetrics(it) != null } >= 2)) {
++            return TripProgress(true, selected, null, null, null)
++        }
++        val tariff = TarifCatalog.titles.sortedByDescending(String::length).firstOrNull { name ->
++            lines.any { it.equals(name, true) || pay.containsMatchIn(it) && it.endsWith(name, true) }
++        }
++        val destination = lines.mapIndexedNotNull { i, line ->
++            val tail = destinationRow.matchEntire(line)?.groupValues?.get(1)
++                ?: lines.getOrNull(i + 1)?.takeIf { bareDestination.matches(line) }
++            tail?.replace(clockSuffix, "")?.takeIf {
++                it.any(Char::isLetter) && !TripBadgeReader.isMeasurement(it) &&
++                    it.any(Char::isDigit) && !pay.containsMatchIn(it)
++            }
++        }.distinct().singleOrNull()
++        val payment = lines.any(pay::containsMatchIn)
++        val caption = lines.indexOfFirst(amountCaption::containsMatchIn)
++        val active = (lines.any(finish::matches) && (payment || caption >= 0)) ||
++            (payment && destination != null && tariff != null && lines.any { clockSuffix.containsMatchIn(it) })
++        if (!active) return null
++        val gross = if (caption >= 0) {
++            lines.subList((caption - 1).coerceAtLeast(0), (caption + 2).coerceAtMost(lines.size))
++                .mapNotNull { line ->
++                    val value = amount.find(line)?.groupValues?.get(1)?.filter(Char::isDigit)?.toDoubleOrNull()
++                    value?.takeIf { it in 1.0..100_000.0 && (pay.containsMatchIn(line) ||
++                        amountCaption.containsMatchIn(line) || amount.matches(line)) }
++                }.distinct().singleOrNull()
++        } else null
++        val nav = lines.indices.mapNotNull { i ->
++            val row = lines[i]
++            if (!clockSuffix.containsMatchIn(row) && !row.matches(Regex("""\d{1,2}:\d{2}"""))) {
++                return@mapNotNull null
++            }
++            TripBadgeReader.parseMetrics(row.replace(clockSuffix, ""))
++                ?: if (i >= 2 && row.matches(Regex("""\d{1,2}:\d{2}"""))) {
++                    TripBadgeReader.parseMetrics(lines[i - 2] + " " + lines[i - 1])
++                } else null
++        }.distinct().singleOrNull()
++        return TripProgress(false, nav, gross, destination, tariff)
++    }
++
++    private fun rows(text: String) = text.replace('\u00a0', ' ').replace('\u202f', ' ')
++        .lines().map(String::trim).filter(String::isNotEmpty)
++}
++
++class TripProgressState {
++    private var incoming: OrderTextParser.Detected? = null
++    private var seenAt = 0L
++    private var selected: TripBadge? = null
++    private var active: OrderTextParser.Detected? = null
++    private var activeAt: Long? = null
++
++    fun hasContext(now: Long) = active != null || incoming != null && now - seenAt in 0L..600_000L
++
++    fun remember(offer: OrderTextParser.Detected, now: Long) {
++        val prior = incoming
++        if (prior?.destination != offer.destination || prior?.pickup != offer.pickup || prior?.tariff != offer.tariff || active != null) {
++            clear()
++        }
++        incoming = offer
++        seenAt = now
++    }
++
++    fun update(progress: TripProgress, now: Long): OrderTextParser.Detected? {
++        val prior = incoming?.takeIf { now - seenAt in 0L..600_000L }
++        if (progress.selecting) {
++            val offer = prior ?: return null
++            if (active != null) return null
++            selected = progress.route ?: selected
++            return offer.copy(tripBadge = selected ?: offer.tripBadge)
++        }
++        val match = progress.destination
++        val linked = (active ?: prior)?.takeIf { known ->
++            match != null && known.destination?.let { OrderTextParser.samePoint(it, match) } == true &&
++                (progress.tariff == null || progress.tariff == known.tariff)
++        }
++        val last = active
++        if (linked == null && (progress.gross == null || progress.tariff == null)) return null
++        if (linked == null) {
++            active = null
++            activeAt = null
++            selected = null
++        }
++        val started = activeAt ?: now.also { activeAt = it }
++        val chosen = selected ?: linked?.tripBadge
++        val earlyNav = progress.route?.takeIf { now - started in 0L..60_000L &&
++            (chosen == null || it.km in chosen.km * 0.90..chosen.km * 1.12) }
++        val actualPrice = progress.gross ?: linked?.displayedGross?.takeIf { last != null }
++        val quote = (linked ?: OrderTextParser.Detected(
++            true, progress.tariff, null, false, null, match, null, null
++        )).copy(displayedGross = actualPrice,
++            tripBadge = earlyNav ?: last?.tripBadge?.takeIf { linked != null } ?: selected ?: linked?.tripBadge)
++        active = quote
++        return quote
++    }
++
++    fun clear() {
++        incoming = null
++        selected = null
++        active = null
++        activeAt = null
++        seenAt = 0L
++    }
++}
+--- a/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
++++ b/app/src/main/java/kz/taxiprofitai/WindowOcr.kt
+@@ -33,7 +33,7 @@
+         if (badgeOnly) badgeTess = api else tess = api
+         return api
+     }
+-    data class Reading(val text:String?,val purple:Long?,val cardOnly:Boolean,val badge:TripBadge?)
++    data class Reading(val text:String?,val purple:Long?,val cardOnly:Boolean,val badge:TripBadge?,val progress:TripProgress?)
+     fun prepare() {
+         worker.execute {
+             if (!closed) {
+@@ -42,7 +42,7 @@
+         }
+     }
+ 
+-    fun recognize(result:AccessibilityService.ScreenshotResult,badgeOnly:Boolean,done:(Reading?)->Unit){
++    fun recognize(result:AccessibilityService.ScreenshotResult,badgeOnly:Boolean,progressOnly:Boolean,done:(Reading?)->Unit){
+         val buffer=result.hardwareBuffer
+         if(closed){buffer.close();done(null);return}
+         try{
+@@ -53,13 +53,15 @@
+                 var purple:Long?=null
+                 var cardOnly = false
+                 var badge: TripBadge? = null
++                var progress: TripProgress? = null
+                 try{
+                     if(!closed){
+                         hw=Bitmap.wrapHardwareBuffer(buffer,result.colorSpace)
+                         bitmap=hw?.copy(Bitmap.Config.ARGB_8888,false)
+                         if(bitmap!=null && !closed){
+-                            badge = readTripBadge(bitmap, engine(badgeOnly = true))
+-                            if (!badgeOnly) {
++                            if (progressOnly) progress = readProgress(bitmap, engine(badgeOnly = true))
++                            else badge = readTripBadge(bitmap, engine(badgeOnly = true))
++                            if (!badgeOnly && !progressOnly) {
+                                 val api = engine()
+                                 text = readOrderCard(bitmap, api)
+                                 cardOnly = text != null
+@@ -75,10 +77,61 @@
+                         }
+                     }
+                 }catch(e:Exception){}catch(e:LinkageError){}
+-                finally{bitmap?.recycle();hw?.recycle();buffer.close();done(if(closed)null else Reading(text,purple,cardOnly,badge))}
++                finally{bitmap?.recycle();hw?.recycle();buffer.close();done(if(closed)null else Reading(text,purple,cardOnly,badge,progress))}
+             }
+         }catch(e:java.util.concurrent.RejectedExecutionException){buffer.close();done(null)}
+     }
++    private fun readProgress(bitmap: Bitmap, api: TessBaseAPI): TripProgress? {
++        val top = (bitmap.height * .51).toInt()
++        val bottom = (bitmap.height * .985).toInt()
++        val card = Bitmap.createBitmap(bitmap, 0, top, bitmap.width, bottom - top)
++        val raw = try {
++            api.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK)
++            api.setImage(card)
++            api.getUTF8Text()?.takeIf { api.meanConfidence() >= 48 }
++        } finally {
++            api.clear()
++            api.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
++            card.recycle()
++        } ?: return null
++        if (TripProgressReader.selecting(raw)) return TripProgressReader.read(raw, checkedRoute(bitmap, api))
++        val progress = TripProgressReader.read(raw) ?: return null
++        if (progress.gross != null || progress.route != null) return progress
++        val label = readMonochrome(bitmap, api, (bitmap.width * .04).toInt(), (bitmap.height * .752).toInt(),
++            (bitmap.width * .92).toInt(), (bitmap.height * .027).toInt(), true,
++            TessBaseAPI.PageSegMode.PSM_SINGLE_LINE) ?: return progress
++        return TripProgressReader.read("$raw\n$label") ?: progress
++    }
++
++    private fun checkedRoute(bitmap: Bitmap, api: TessBaseAPI): TripBadge? {
++        val w = bitmap.width
++        val h = bitmap.height
++        val left = (w * .88).toInt()
++        val row = IntArray((w * .10).toInt())
++        if (row.isEmpty()) return null
++        val runs = mutableListOf<Int>()
++        var start = -1
++        val limit = (h * .84).toInt()
++        for (y in (h * .58).toInt()..limit) {
++            bitmap.getPixels(row, 0, row.size, left, y, row.size, 1)
++            val yellow = row.count {
++                ((it ushr 16) and 255) > 200 && ((it ushr 8) and 255) > 165 && (it and 255) < 110
++            }
++            if (yellow >= w * .022 && y != limit) {
++                if (start < 0) start = y
++            } else if (start >= 0) {
++                if (y - start in (w * .025).toInt()..(w * .09).toInt()) runs.add((y + start) / 2)
++                start = -1
++            }
++        }
++        val center = runs.singleOrNull() ?: return null
++        val width = (w * .80).toInt()
++        val rowHeight = (w * .07).toInt()
++        val text = readMonochrome(bitmap, api, 0, center - rowHeight / 2, width, rowHeight, true,
++            TessBaseAPI.PageSegMode.PSM_SINGLE_LINE) ?: return null
++        return TripBadgeReader.parseMetrics(text.trim())
++    }
++
+     private fun readTripBadge(bitmap: Bitmap, api: TessBaseAPI): TripBadge? {
+         val step = (bitmap.width / 270).coerceAtLeast(2)
+         val width = bitmap.width / step
+--- /dev/null
++++ b/core-tests/TripProgressCheck.kt
+@@ -0,0 +1,38 @@
++package kz.taxiprofitai
++
++import kotlin.math.abs
++
++fun main() {
++    val initial = OrderTextParser.parse("Пропустить\nБ 12 км 1 ч 20 мин\n500 м · 4 мин\nБлижняя подача\n" +
++        "Комфорт+\nА: улица Богенбай батыра, 135\nБ: Центральная улица, 8\nПассажир\nПринять ×1.00")
++    val chooser = "Укажите маршрут\n12 км · 1 ч 2 мин\n12 км · 1 ч 7 мин\n12 км · 1 ч 15 мин\n11 км · 1 ч 17 мин\nПоехали"
++    val selected = TripProgressReader.read(chooser, TripBadge(12.0, 62))!!
++    check(selected.selecting && selected.route == TripBadge(12.0, 62))
++    check(TripProgressReader.read(chooser)?.route == null)
++    val nav = "480 м\nулица Магаза Масанчи\n12 км 1ч1 мин 19:00\n(5) Центральная улица, 8 04:37\nОплата картой Комфорт+"
++    val firstNav = TripProgressReader.read(nav)!!
++    check(!firstNav.selecting && firstNav.route == TripBadge(12.0, 61) && firstNav.gross == null)
++    val inProgress = "(5) Центральная улица, 8 04:43\n[28 Оплата картой 4090т\n" +
++        "Стоимость поездки с учетом пробок\n© Пассажир 5.00\nКомфорт+\nОжидание\n© Завершить"
++    val price = TripProgressReader.read(inProgress)!!
++    check(price.gross == 4090.0 && price.destination == "Центральная улица, 8")
++    check(TripProgressReader.read(inProgress.replace("4090т", "+4090т"))?.gross == null)
++    check(TripProgressReader.read(inProgress.replace("4090т", "от 4090т"))?.gross == null)
++    check(TripProgressReader.read(inProgress.replace("Стоимость поездки с учетом пробок", ""))?.gross == null)
++    check(TripProgressReader.read("от 1230 ₸\nПоехали") == null)
++
++    val state = TripProgressState()
++    check(state.update(selected, 1L) == null)
++    state.remember(initial, 1_000)
++    check(state.update(selected, 241_000)?.tripBadge == TripBadge(12.0, 62))
++    check(state.update(firstNav, 260_000)?.tripBadge == TripBadge(12.0, 61))
++    check(state.update(firstNav.copy(route = TripBadge(7.0, 42)), 560_000)?.tripBadge == TripBadge(12.0, 61))
++    check(state.update(price, 561_000)?.let { it.displayedGross == 4090.0 && it.pickup == initial.pickup } == true)
++    check(state.update(firstNav, 563_000)?.displayedGross == 4090.0)
++    state.clear()
++    check(state.update(firstNav, 564_000) == null)
++    check(state.update(price, 565_000)?.pickup == null)
++    val net = CommissionCatalog.calculate(4090.0, 4090.0, 19.2, 1.0).net!!
++    check(abs(net - 3263.82) < 0.01)
++    println("Incoming, selected route, remaining ETA, and displayed in-trip price verified")
++}
