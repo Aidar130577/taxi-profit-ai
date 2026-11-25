@@ -1,0 +1,251 @@
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/AlmatyLookupKey.kt
+@@ -0,0 +1,39 @@
++package kz.taxiprofitai
++
++import java.text.Normalizer
++import java.util.Locale
++
++/** These normalizations match build_almaty_index.py. */
++object AlmatyLookupKey {
++    private val words = Regex("""[^\p{L}\p{N}]+""")
++    private val street = Regex("""(?iu)\b(?:улица|ул|проспект|просп|пр|микрорайон|мкр|көшесі|даңғылы|street|avenue)\b""")
++    private val corpus = Regex("""(?iu)(\d+[а-яa-z]?)\s*(?:корпус|корп|к|k)\s*(\d+[а-яa-z]?)\b""")
++    private val prefix = Regex("""(?iu)^(?:кафе|кофейня|ресторан|магазин|трц|тц|бц|жк|здание|отель|гостиница)\s+""")
++    private val city = Regex("""(?iu)(?:^Алматы\s*,\s*|\s*,\s*(?:город\s+)?Алматы(?:\s*,\s*Казахстан)?\s*$)""")
++
++    private val nazarbayev = Regex("""^(?:имени нурсултана )?назарбаева (?=\d)""")
++    private val latin = mapOf(
++        'а' to "a", 'б' to "b", 'в' to "v", 'г' to "g", 'д' to "d", 'е' to "e", 'ж' to "zh",
++        'з' to "z", 'и' to "i", 'й' to "y", 'к' to "k", 'л' to "l", 'м' to "m", 'н' to "n",
++        'о' to "o", 'п' to "p", 'р' to "r", 'с' to "s", 'т' to "t", 'у' to "u", 'ф' to "f",
++        'х' to "kh", 'ц' to "ts", 'ч' to "ch", 'ш' to "sh", 'щ' to "shch", 'ы' to "y",
++        'э' to "e", 'ю' to "yu", 'я' to "ya", 'ь' to "", 'ъ' to "",
++        'ә' to "a", 'ғ' to "g", 'қ' to "k", 'ң' to "ng", 'ө' to "o", 'ұ' to "u",
++        'ү' to "u", 'һ' to "h", 'і' to "i"
++    )
++
++    fun candidates(raw: String, address: Boolean): List<String> {
++        val native = normalize(raw, address)
++        val alternate = if (address) native.replace(nazarbayev, "назарбаев ")
++            else native.map { latin[it] ?: it.toString() }.joinToString("")
++        return listOf(native, alternate).distinct().filter { it.length >= 3 }
++    }
++
++    fun normalize(raw: String, address: Boolean): String {
++        val text = Normalizer.normalize(raw.replace(city, ""), Normalizer.Form.NFKC)
++            .lowercase(Locale.ROOT).replace('ё', 'е').trim()
++        val cleaned = if (address) text.replace(corpus, "$1 корпус $2").replace(street, " ")
++            else text.replace(prefix, "")
++        return cleaned.replace(words, " ").trim()
++    }
++}
+--- a/app/src/main/java/kz/taxiprofitai/MainActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/MainActivity.kt
+@@ -108,6 +108,16 @@
+         if (android.os.Build.VERSION.SDK_INT >= 34) {
+             root.addView(action("Распознавание адресов"){ showOcrSettings() })
+         }
++        root.addView(action("Данные карты © OpenStreetMap") {
++            android.app.AlertDialog.Builder(this)
++                .setTitle("Офлайн-данные Алматы")
++                .setMessage("© OpenStreetMap contributors, ODbL 1.0. Источник выгрузки — Geofabrik. Адреса и названия мест ищутся в индексе внутри приложения. Дороги для расчёта маршрута загружаются отдельно в BRouter.")
++                .setNegativeButton("Закрыть", null)
++                .setPositiveButton("Лицензия"){ _, _ ->
++                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://www.openstreetmap.org/copyright")))
++                }
++                .show()
++        })
+         scroll.addView(root)
+         setContentView(scroll)
+         root.requestFocus()
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
+@@ -16,6 +16,10 @@
+     private var footer="Нажмите, чтобы свернуть"
+     private val density=resources.displayMetrics.density
+     private var waiting = true
++    private var pickup: String? = null
++    private var destination: String? = null
++    private val showAddresses get() = pickup != null || destination != null
++    private val logicalHeight get() = if (waiting) 38 else if (showAddresses) 134 else 104
+ 
+     init {
+         isClickable = true
+@@ -25,7 +29,7 @@
+ 
+     override fun onMeasure(w: Int, h: Int) {
+         val width = resolveSize((240 * density).toInt(), w)
+-        val height = (if (waiting) 38 else 104) * width / 240
++        val height = logicalHeight * width / 240
+         setMeasuredDimension(width, resolveSize(height, h))
+     }
+ 
+@@ -46,8 +50,7 @@
+     override fun onDraw(c:Canvas){
+         super.onDraw(c)
+         c.save()
+-        val logicalHeight = if (waiting) 38f else 104f
+-        c.scale(width / 240f, height / logicalHeight)
++        c.scale(width / 240f, height.toFloat() / logicalHeight)
+         val border = RectF(1f, 1f, 239f, logicalHeight - 1f)
+         paint.style = Paint.Style.FILL
+         paint.color = Color.rgb(22, 32, 39)
+@@ -65,14 +68,22 @@
+         text(c,demandText,234f,23f,18f,purple,true,Paint.Align.RIGHT,86f)
+         line(c,29f);text(c,gross,120f,47f,18f,yellow,true,Paint.Align.CENTER,230f,true)
+         text(c,net,120f,74f,25f,green,true,Paint.Align.CENTER,230f,true)
+-        line(c,78f);text(c,footer,120f,96f,14f,Color.WHITE,false,Paint.Align.CENTER,228f)
++        line(c,78f)
++        if (showAddresses) {
++            text(c, "А  ${pickup ?: "—"}", 7f, 90f, 11f, Color.WHITE, false, Paint.Align.LEFT, 225f)
++            text(c, "Б  ${destination ?: "—"}", 7f, 103f, 11f, Color.WHITE, false, Paint.Align.LEFT, 225f)
++            line(c,108f)
++        }
++        text(c,footer,120f,if (showAddresses) 126f else 96f,14f,Color.WHITE,false,Paint.Align.CENTER,228f)
+         c.restore()
+     }
+-    fun showQuote(tariff:String,demand:String,estimate:LiveFareEstimate?,status:String,ratesExpired:Boolean,parkPct:Double){
+-        if (waiting) {
+-            waiting = false
+-            requestLayout()
+-        }
++    fun showQuote(tariff:String,demand:String,estimate:LiveFareEstimate?,status:String,ratesExpired:Boolean,
++                  parkPct:Double, pickupAddress:String?, destinationAddress:String?){
++        val oldHeight = logicalHeight
++        pickup = pickupAddress
++        destination = destinationAddress
++        waiting = false
++        if (logicalHeight != oldHeight) requestLayout()
+         title=when(tariff){"BS"->"Business BS";"EK"->"Economy EK";"K"->"Comfort K";"K+"->"Comfort K+";"EV"->"Electric EV";"PR"->"Premier PR";else->tariff}
+         demandText=if(demand.startsWith("+"))demand else "—"
+         footer=when {
+@@ -90,7 +101,8 @@
+         val quote=NetQuotePresenter.present(estimate,parkPct)
+         gross="СТОИМОСТЬ ${quote.grossText}${if(ratesExpired && estimate!=null && !estimate.fromOrder)"*" else ""}"
+         net="НА РУКИ ${quote.takeHomeText}"
+-        contentDescription="$title $demandText. $gross. $net. $status. Нажмите, чтобы свернуть."
++        val route = if (showAddresses) "А: ${pickup ?: "—"}. Б: ${destination ?: "—"}." else ""
++        contentDescription="$title $demandText. $gross. $net. $route $status. Нажмите, чтобы свернуть."
+         invalidate()
+     }
+ }
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/OfflineAlmatyIndex.kt
+@@ -0,0 +1,61 @@
++package kz.taxiprofitai
++
++import android.content.Context
++import android.database.sqlite.SQLiteDatabase
++import java.io.File
++
++/** Offline coordinates for Almaty addresses and named places. No addresses are persisted. */
++class OfflineAlmatyIndex(private val context: Context) {
++    fun find(raw: String): BRouterConnector.Point? {
++        val queries = PlaceLookup.queries(raw)
++        val name = queries.lastOrNull() ?: return null
++        val path = indexFile() ?: return null
++        SQLiteDatabase.openDatabase(path.path, null, SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS)
++            .use { db ->
++                for (kind in listOf(0, 1)) {
++                    for (key in AlmatyLookupKey.candidates(name, address = kind == 0)) {
++                        val points = db.rawQuery(
++                            "select lat, lon from places where key = ? and kind = ? limit 80",
++                            arrayOf(key, kind.toString())
++                        ).use { cursor ->
++                            buildList {
++                                while (cursor.moveToNext()) add(BRouterConnector.Point(
++                                    cursor.getInt(0) / 1_000_000.0, cursor.getInt(1) / 1_000_000.0
++                                ))
++                            }
++                        }
++                        if (points.isEmpty()) continue
++                        val first = points.first()
++                        if (points.size == 80 || points.any {
++                                kotlin.math.abs(it.lat - first.lat) > 0.0008 ||
++                                    kotlin.math.abs(it.lon - first.lon) > 0.001
++                            }) error("Место не найдено однозначно")
++                        return first
++                    }
++                }
++            }
++        return null
++    }
++
++    @Suppress("DEPRECATION")
++    private fun indexFile(): File? = synchronized(fileLock) {
++        val revision = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
++        val path = File(context.cacheDir, "almaty-osm-$revision.sqlite")
++        if (path.isFile) return@synchronized path
++        val temp = File(context.cacheDir, "almaty-osm.tmp")
++        runCatching {
++            context.assets.open("almaty-osm.sqlite").use { source ->
++                temp.outputStream().use { target -> source.copyTo(target) }
++            }
++            check(temp.renameTo(path))
++            context.cacheDir.listFiles()?.filter {
++                it != path && it.name.startsWith("almaty-osm-") && it.extension == "sqlite"
++            }?.forEach { it.delete() }
++            path
++        }.onFailure { temp.delete() }.getOrNull()
++    }
++
++    private companion object {
++        val fileLock = Any()
++    }
++}
+--- a/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
+@@ -15,6 +15,7 @@
+     private val ui = Handler(Looper.getMainLooper())
+     private val geocodeWorker = Executors.newSingleThreadExecutor()
+     private val brouter = BRouterConnector(appContext)
++    private val offlineAlmaty = OfflineAlmatyIndex(appContext)
+     private val pointCache = object: LinkedHashMap<String,BRouterConnector.Point>(32,0.75f,true) {
+         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String,BRouterConnector.Point>?): Boolean = size > 32
+     }
+@@ -50,7 +51,7 @@
+         // Explicit coordinates are helpful for a completely offline routing test, without any geocoder.
+         val match=Regex("^\\s*(4[23]\\.\\d{3,}),\\s*(7[567]\\.\\d{3,})\\s*$").find(norm)
+         val found=if(match!=null) BRouterConnector.Point(match.groupValues[1].toDouble(),match.groupValues[2].toDouble())
+-        else {
++        else offlineAlmaty.find(raw) ?: run {
+             @Suppress("DEPRECATION")
+             val geocoder=Geocoder(appContext,Locale("ru","KZ"))
+             val queries = PlaceLookup.queries(raw)
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -110,7 +110,7 @@
+             PixelFormat.TRANSLUCENT
+         ).apply { gravity = Gravity.TOP or Gravity.START }
+         val maxX = (screenWidth() - layout.width).coerceAtLeast(0)
+-        val maxY = (screenHeight() - dp(112)).coerceAtLeast(0)
++        val maxY = (screenHeight() - dp(142)).coerceAtLeast(0)
+         layout.x = prefs.getInt("calculator_x", ((screenWidth() - layout.width) / 2)).coerceIn(0, maxX)
+         layout.y = prefs.getInt("calculator_y", dp(96)).coerceIn(0, maxY)
+         val slop = ViewConfiguration.get(this).scaledTouchSlop
+@@ -386,7 +386,7 @@
+             panel.showQuote(detected.tariff?.let {TarifCatalog.shortName(it)} ?: "Заказ",
+                 demand,estimate,routeStatus,
+                 detected.tariff?.let {TarifCatalog.rateExpired(it)} ?: TarifCatalog.expiredToday(),
+-                CommissionSettings.park(prefs))
++                CommissionSettings.park(prefs), detected.pickup, detected.destination)
+         } else panel.showWaiting()
+     }
+     override fun onInterrupt(){}
+--- a/core-tests/LocalFareLearningCheck.kt
++++ b/core-tests/LocalFareLearningCheck.kt
+@@ -72,5 +72,12 @@
+     check(PlaceLookup.namedMatch("Кафе «Ласточка»", listOf(city, branch)) == branch)
+     check(PlaceLookup.namedMatch("Ласточка", listOf(branch, branch.copy(lat = 43.28))) == null)
+     check(PlaceLookup.namedMatch("Ласточка", listOf(city)) == null)
+-    println("42 calculator, incoming card and named place checks passed")
++    check(AlmatyLookupKey.normalize("проспект Назарбаева, 28Ак14", true) == "назарбаева 28а корпус 14")
++    check(AlmatyLookupKey.normalize("Алматы, ул. Тестовая, 4 к 3", true) == "тестовая 4 корпус 3")
++    check(AlmatyLookupKey.normalize("Кафе «Ласточка», Алматы", false) == "ласточка")
++    check(AlmatyLookupKey.normalize("мкр. Самал-2, 4", true) == "самал 2 4")
++    check(AlmatyLookupKey.candidates("Мега Парк", false) == listOf("мега парк", "mega park"))
++    check(AlmatyLookupKey.candidates("проспект Назарбаева, 28Ак14", true) ==
++        listOf("назарбаева 28а корпус 14", "назарбаев 28а корпус 14"))
++    println("48 calculator, incoming card and offline address checks passed")
+ }

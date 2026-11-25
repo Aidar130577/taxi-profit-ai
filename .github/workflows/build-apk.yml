@@ -103,6 +103,7 @@ jobs:
           patch --batch -p1 < ../patches/calculator-v26.patch
           patch --batch -p1 < ../patches/calculator-v27.patch
           patch --batch -p1 < ../patches/calculator-v28.patch
+          patch --batch -p1 < ../patches/calculator-v29.patch
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -124,7 +125,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 28').replace('0.17.0-approved-overlays', '0.28.0-named-places'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 29').replace('0.17.0-approved-overlays', '0.29.0-offline-almaty'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -151,10 +152,17 @@ jobs:
         working-directory: android-project
         run: |
           command -v kotlinc
-          kotlinc app/src/main/java/kz/taxiprofitai/Engine.kt app/src/main/java/kz/taxiprofitai/CommissionCatalog.kt app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/OfferPopupState.kt core-tests/OfferDemandCheck.kt core-tests/OfferPopupCheck.kt app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt app/src/main/java/kz/taxiprofitai/NetQuotePresentation.kt app/src/main/java/kz/taxiprofitai/PlaceLookup.kt core-tests/LocalFareLearningCheck.kt -include-runtime -d /tmp/offer-demand.jar
+          kotlinc app/src/main/java/kz/taxiprofitai/Engine.kt app/src/main/java/kz/taxiprofitai/CommissionCatalog.kt app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/OfferPopupState.kt core-tests/OfferDemandCheck.kt core-tests/OfferPopupCheck.kt app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt app/src/main/java/kz/taxiprofitai/NetQuotePresentation.kt app/src/main/java/kz/taxiprofitai/PlaceLookup.kt app/src/main/java/kz/taxiprofitai/AlmatyLookupKey.kt core-tests/LocalFareLearningCheck.kt -include-runtime -d /tmp/offer-demand.jar
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.OfferDemandCheckKt
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.OfferPopupCheckKt
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.LocalFareLearningCheckKt
+      - name: Build offline Almaty address index
+        run: |
+          python3 -m pip install --target "$RUNNER_TEMP/osm-python" 'osmium==4.3.2'
+          curl --fail --location --retry 3 --max-time 240 \
+            'https://download.geofabrik.de/asia/kazakhstan-latest.osm.pbf' -o "$RUNNER_TEMP/kazakhstan.osm.pbf"
+          PYTHONPATH="$RUNNER_TEMP/osm-python" python3 patches/build_almaty_index.py \
+            "$RUNNER_TEMP/kazakhstan.osm.pbf" android-project/app/src/main/assets/almaty-osm.sqlite
       - name: Assemble test APK
         working-directory: android-project
         run: gradle --no-daemon --stacktrace :app:assembleDebug
@@ -163,17 +171,18 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='28'" apk-badging.txt
+          grep -q "versionCode='29'" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
+          unzip -l "$APK" | grep "assets/almaty-osm.sqlite"
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
-          cp "$APK" ZnayTsenu-v28.apk
+          cp "$APK" ZnayTsenu-v29.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v28-branded-apk
-          path: ZnayTsenu-v28.apk
+          name: ZnayTsenu-v29-branded-apk
+          path: ZnayTsenu-v29.apk
           retention-days: 7
           if-no-files-found: error
