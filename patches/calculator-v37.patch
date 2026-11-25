@@ -1,0 +1,254 @@
+--- a/app/src/main/java/kz/taxiprofitai/BRouterConnector.kt
++++ b/app/src/main/java/kz/taxiprofitai/BRouterConnector.kt
+@@ -33,8 +33,8 @@
+             drain()
+         }
+         override fun onServiceDisconnected(name: ComponentName?) { router = null }
+-        override fun onBindingDied(name: ComponentName?) { router = null; failPending("Служба BRouter отключилась") }
+-        override fun onNullBinding(name: ComponentName?) { failPending("BRouter не предоставил службу") }
++        override fun onBindingDied(name: ComponentName?) { detach(); failPending("Служба BRouter отключилась") }
++        override fun onNullBinding(name: ComponentName?) { detach(); failPending("BRouter не предоставил службу") }
+     }
+ 
+     /** Call from Android main thread; callback is delivered on the same thread. */
+@@ -42,16 +42,20 @@
+         if (closed) { callback(Result.failure(IllegalStateException("Маршрутизатор закрыт"))); return }
+         queue.addLast(Request(a,b,callback))
+         if (router != null) { drain();return }
+-        if (!bound) {
+-            val i = Intent().setClassName("btools.routingapp", "btools.routingapp.BRouterService")
+-            try {
+-                bound = context.bindService(i, connection, Context.BIND_AUTO_CREATE)
+-                if (!bound) failPending("BRouter не установлен или его сервис недоступен")
+-            } catch (e: Exception) {
+-                bound = false
+-                failPending("Не удалось подключить BRouter: ${e.message}")
+-            }
+-        }
++        prepare()
++        if (!bound) failPending("BRouter не установлен или его сервис недоступен")
++    }
++
++    fun prepare() {
++        if (closed || bound) return
++        val intent = Intent().setClassName("btools.routingapp", "btools.routingapp.BRouterService")
++        bound = runCatching { context.bindService(intent, connection, Context.BIND_AUTO_CREATE) }.getOrDefault(false)
++    }
++
++    private fun detach() {
++        if (bound) runCatching { context.unbindService(connection) }
++        bound = false
++        router = null
+     }
+     private fun drain() {
+         val service = router ?: return
+@@ -79,8 +83,7 @@
+     fun close() {
+         closed=true
+         failPending("Маршрутизатор закрыт")
+-        if (bound) runCatching { context.unbindService(connection) }
+-        bound=false; router=null
++        detach()
+         worker.shutdownNow()
+     }
+ }
+--- a/app/src/main/java/kz/taxiprofitai/OfflineAlmatyIndex.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfflineAlmatyIndex.kt
+@@ -6,42 +6,53 @@
+ 
+ /** Offline coordinates for Almaty addresses and named places. No addresses are persisted. */
+ class OfflineAlmatyIndex(private val context: Context) {
++    fun prepare(): Boolean {
++        val file = indexFile() ?: return false
++        return open(file).use { db -> db.rawQuery("select key from places limit 1", null).use { it.moveToFirst() } }
++    }
++
++    private fun open(file: File) = SQLiteDatabase.openDatabase(
++        file.path, null, SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS
++    )
++
+     fun find(raw: String): BRouterConnector.Point? {
+         val queries = PlaceLookup.queries(raw)
+         val name = queries.lastOrNull() ?: return null
+         val path = indexFile() ?: return null
+-        SQLiteDatabase.openDatabase(path.path, null, SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS)
+-            .use { db ->
+-                for (kind in listOf(0, 1)) {
+-                    for (key in AlmatyLookupKey.candidates(name, address = kind == 0)) {
+-                        val points = db.rawQuery(
+-                            "select lat, lon from places where key = ? and kind = ? limit 80",
+-                            arrayOf(key, kind.toString())
+-                        ).use { cursor ->
+-                            buildList {
+-                                while (cursor.moveToNext()) add(BRouterConnector.Point(
+-                                    cursor.getInt(0) / 1_000_000.0, cursor.getInt(1) / 1_000_000.0
+-                                ))
+-                            }
++        open(path).use { db ->
++            for (kind in listOf(0, 1)) {
++                for (key in AlmatyLookupKey.candidates(name, address = kind == 0)) {
++                    val points = db.rawQuery(
++                        "select lat, lon from places where key = ? and kind = ? limit 80",
++                        arrayOf(key, kind.toString())
++                    ).use { cursor ->
++                        buildList {
++                            while (cursor.moveToNext()) add(BRouterConnector.Point(
++                                cursor.getInt(0) / 1_000_000.0, cursor.getInt(1) / 1_000_000.0
++                            ))
+                         }
+-                        if (points.isEmpty()) continue
+-                        val first = points.first()
+-                        if (points.size == 80 || points.any {
+-                                kotlin.math.abs(it.lat - first.lat) > 0.0008 ||
+-                                    kotlin.math.abs(it.lon - first.lon) > 0.001
+-                            }) error("Место не найдено однозначно")
+-                        return first
+                     }
++                    if (points.isEmpty()) continue
++                    val first = points.first()
++                    if (points.size == 80 || points.any {
++                            kotlin.math.abs(it.lat - first.lat) > 0.0008 ||
++                                kotlin.math.abs(it.lon - first.lon) > 0.001
++                        }) error("Место не найдено однозначно")
++                    return first
+                 }
+             }
++        }
+         return null
+     }
+ 
++    private var preparedFile: File? = null
++
+     @Suppress("DEPRECATION")
+     private fun indexFile(): File? = synchronized(fileLock) {
++        preparedFile?.takeIf { it.isFile }?.let { return@synchronized it }
+         val revision = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
+         val path = File(context.cacheDir, "almaty-osm-$revision.sqlite")
+-        if (path.isFile) return@synchronized path
++        if (path.isFile) return@synchronized path.also { preparedFile = it }
+         val temp = File(context.cacheDir, "almaty-osm.tmp")
+         runCatching {
+             context.assets.open("almaty-osm.sqlite").use { source ->
+@@ -51,7 +62,7 @@
+             context.cacheDir.listFiles()?.filter {
+                 it != path && it.name.startsWith("almaty-osm-") && it.extension == "sqlite"
+             }?.forEach { it.delete() }
+-            path
++            path.also { preparedFile = it }
+         }.onFailure { temp.delete() }.getOrNull()
+     }
+ 
+--- a/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
+@@ -5,6 +5,7 @@
+ import android.os.Handler
+ import android.os.Looper
+ import java.util.Locale
++import java.util.concurrent.CompletableFuture
+ import java.util.concurrent.Executors
+ 
+ /** Address -> coordinates -> BRouter, without storing passenger addresses or contacting proprietary APIs.
+@@ -13,7 +14,7 @@
+ class OfflineRoutePipeline(context: Context) {
+     private val appContext = context.applicationContext
+     private val ui = Handler(Looper.getMainLooper())
+-    private val geocodeWorker = Executors.newSingleThreadExecutor()
++    private val geocodeWorker = Executors.newFixedThreadPool(2)
+     private val brouter = BRouterConnector(appContext)
+     private val offlineAlmaty = OfflineAlmatyIndex(appContext)
+     private val pointCache = object: LinkedHashMap<String,BRouterConnector.Point>(32,0.75f,true) {
+@@ -24,27 +25,57 @@
+     private val routeCache = object: LinkedHashMap<String,Pair<Long,OfflineRoute>>(20,0.75f,true) {
+         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String,Pair<Long,OfflineRoute>>?): Boolean = size > 20
+     }
++    // Only accessed from the main thread. Identical lookups share the in-flight result.
++    private val pendingRoutes = mutableMapOf<String, MutableList<(Result<OfflineRoute>) -> Unit>>()
+     private val routeTtlMs = 5 * 60 * 1000L
++
++    fun prepare() {
++        if (closed) return
++        brouter.prepare()
++        geocodeWorker.execute {
++            if (!closed) runCatching { offlineAlmaty.prepare() }.onSuccess { prepared ->
++                if (prepared) android.util.Log.i("ZnayTsenuService", "Almaty lookup prepared")
++            }
++        }
++    }
+ 
+     fun calculate(a: String, b: String, callback: (Result<OfflineRoute>) -> Unit) {
+         if (closed) return
+         val key = a.trim().lowercase(Locale.ROOT) + "|" + b.trim().lowercase(Locale.ROOT)
+         val existing = synchronized(routeCache) { routeCache[key] }
+-        if (existing!=null && System.currentTimeMillis()-existing.first in 0..routeTtlMs) {
+-            ui.post { if(!closed) callback(Result.success(existing.second)) }
++        if (existing != null && System.currentTimeMillis() - existing.first in 0..routeTtlMs) {
++            ui.post { if (!closed) callback(Result.success(existing.second)) }
+             return
+         }
+-        geocodeWorker.execute {
+-            val pair = runCatching { resolve(a) to resolve(b) }
+-            ui.post {
+-                if (closed) return@post
+-                pair.fold(onSuccess = { (p1,p2) -> brouter.route(p1,p2) {r ->
+-                    r.onSuccess {route -> synchronized(routeCache) {routeCache[key]=System.currentTimeMillis() to route} }
+-                    callback(r)
+-                } }, onFailure={callback(Result.failure(it))})
++        pendingRoutes[key]?.let {
++            it.add(callback)
++            return
++        }
++        pendingRoutes[key] = mutableListOf(callback)
++        val from = CompletableFuture.supplyAsync({ runCatching { resolve(a) } }, geocodeWorker)
++        val to = CompletableFuture.supplyAsync({ runCatching { resolve(b) } }, geocodeWorker)
++        from.thenCombine(to) { start, end -> runCatching { start.getOrThrow() to end.getOrThrow() } }
++            .whenComplete { pair, error ->
++                ui.post {
++                    if (closed) return@post
++                    if (error != null || pair == null) {
++                        complete(key, Result.failure(error ?: IllegalStateException("Не удалось найти адреса")))
++                    } else {
++                        pair.fold(
++                            onSuccess = { (p1, p2) -> brouter.route(p1, p2) { complete(key, it) } },
++                            onFailure = { complete(key, Result.failure(it)) }
++                        )
++                    }
++                }
+             }
+-        }
+     }
++
++    private fun complete(key: String, result: Result<OfflineRoute>) {
++        if (closed) return
++        result.onSuccess { route -> synchronized(routeCache) { routeCache[key] = System.currentTimeMillis() to route } }
++        pendingRoutes.remove(key)?.forEach { it(result) }
++    }
++
+     private fun resolve(raw: String): BRouterConnector.Point {
+         val norm=raw.trim().lowercase(Locale.ROOT)
+         synchronized(pointCache) { pointCache[norm]?.let { return it } }
+@@ -74,5 +105,12 @@
+         synchronized(pointCache) { pointCache[norm]=found }
+         return found
+     }
+-    fun close() { closed=true; brouter.close();geocodeWorker.shutdownNow();synchronized(pointCache){pointCache.clear()};synchronized(routeCache){routeCache.clear()} }
++    fun close() {
++        closed = true
++        pendingRoutes.clear()
++        brouter.close()
++        geocodeWorker.shutdownNow()
++        synchronized(pointCache) { pointCache.clear() }
++        synchronized(routeCache) { routeCache.clear() }
++    }
+ }
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -130,6 +130,9 @@
+         lastScan = 0
+         // Wait for the system to finish binding the service and assigning its overlay token.
+         scheduleScan(200L)
++        if (routePipeline == null) {
++            OfflineRoutePipeline(this).also { routePipeline = it }.prepare()
++        }
+         if (android.os.Build.VERSION.SDK_INT >= 34 && prefs.getBoolean("ocr_allowed", false)) {
+             OcrClient(this).also { ocr = it }.prepare()
+         }

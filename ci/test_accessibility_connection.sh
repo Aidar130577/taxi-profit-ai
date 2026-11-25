@@ -101,6 +101,7 @@ adb logcat -c
 enable_service
 wait_for_log "Order overlay attached"
 wait_for_log "First offer quote drawn"
+wait_for_log "Almaty lookup prepared"
 latency=$(adb logcat -d -s "$log_tag:V" | sed -n 's/.*First offer quote drawn in \([0-9][0-9]*\)ms.*/\1/p' | head -n1)
 test "$latency" -le 4000
 echo "Native test order rendered in ${latency}ms from first detection on Android API $api"
