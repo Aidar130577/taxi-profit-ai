@@ -72,9 +72,34 @@ s = s[:a] + """        line(c,29f)
         c.drawLine(120f, 34f, 120f, 76f, paint)
         text(c,"яндекс",60f,46f,16f,yellow,true,Paint.Align.CENTER,110f)
         text(c,"на руки",180f,46f,16f,green,true,Paint.Align.CENTER,110f)
-        text(c,gross.removePrefix("СТОИМОСТЬ ").replace("≈", "").trim(),60f,70f,22f,yellow,true,Paint.Align.CENTER,110f,true)
-        text(c,net.removePrefix("НА РУКИ "),180f,70f,22f,green,true,Paint.Align.CENTER,110f,true)
+        // Fit both amounts to the same full column width, with 3 logical
+        // pixels of clearance on each side. Keep the same font height.
+        fun amount(value: String, center: Float, color: Int) {
+            val clean = value.replace("≈", "").trim()
+            if (clean.isEmpty()) return
+            compactAmountPaint.color = color
+            compactAmountPaint.textScaleX = 1f
+            val measured = compactAmountPaint.measureText(clean)
+            if (measured > 0f && measured.isFinite()) {
+                compactAmountPaint.textScaleX = 114f / measured
+                c.drawText(clean, center, 70f, compactAmountPaint)
+            }
+            compactAmountPaint.textScaleX = 1f
+        }
+        amount(gross.removePrefix("СТОИМОСТЬ "),60f,yellow)
+        amount(net.removePrefix("НА РУКИ "),180f,green)
 """ + s[b:]
+# Dedicated paint prevents horizontal fitting from affecting other text.
+anchor = "    override fun onDraw(c:Canvas){"
+assert s.count(anchor) == 1
+s = s.replace(anchor, """    private val compactAmountPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        typeface = android.graphics.Typeface.DEFAULT_BOLD
+        textAlign = Paint.Align.CENTER
+        textSize = 22f
+    }
+
+""" + anchor)
 # Match the header and amount nominal font sizes; existing text() width fitting
 # keeps long tariff names, surcharges and high-value amounts inside the panel.
 import re
