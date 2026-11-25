@@ -169,11 +169,11 @@
 -        if(prefs.getBoolean("shift_active",false))startShift()
 +        connected = false
 +        try {
-+            windows = getSystemService(WindowManager::class.java)
-+                ?: error("WindowManager unavailable")
++            windows = getSystemService(WINDOW_SERVICE) as WindowManager
 +            prefs.registerOnSharedPreferenceChangeListener(settingsListener)
 +            prefs.edit().remove(DIAGNOSTIC).apply()
 +            connected = true
++            Log.i("ZnayTsenuService", "Accessibility service connected")
 +            if (prefs.getBoolean("shift_active", false)) startShift()
 +        } catch (e: Exception) {
 +            recordFailure("Подключение службы", e)
@@ -237,7 +237,7 @@
                      }
                      true
                  }
-@@ -151,13 +189,30 @@
+@@ -151,13 +189,31 @@
                  else -> false
              }
          }
@@ -245,6 +245,7 @@
 -        windows.addView(panel, layout)
 +        try {
 +            windows.addView(panel, layout)
++            Log.i("ZnayTsenuService", "Order overlay attached")
 +            popup = panel
 +            overlayAttempts = 0
 +            prefs.edit().remove(DIAGNOSTIC).apply()
@@ -271,7 +272,7 @@
      }
  
      private fun closeOffer() {
-@@ -178,7 +233,8 @@
+@@ -178,7 +234,8 @@
          windowChangedSinceScan = windowChangedSinceScan || windowChanged
          if (windowChanged) {
              cancelScan()
@@ -281,7 +282,7 @@
          } else {
              val elapsed = android.os.SystemClock.elapsedRealtime() - lastScan
              scheduleScan((450L - elapsed).coerceAtLeast(0L))
-@@ -232,7 +288,7 @@
+@@ -232,7 +289,7 @@
      private fun tryOcr(windowId:Int,generation:Long,now:Long,visible:String){
          if(android.os.Build.VERSION.SDK_INT<34 || !prefs.getBoolean("ocr_allowed",false))return
          if(ocrBusy || now-lastOcr<1800L)return
@@ -290,7 +291,7 @@
          ocrBusy=true;lastOcr=now
          val epoch=ocrEpoch
          try{
-@@ -312,7 +368,8 @@
+@@ -312,7 +369,8 @@
                  } else {
                      routeStatus = "Маршрут рассчитывается..."
                      val calcStartedAt = android.os.SystemClock.elapsedRealtime()
@@ -300,7 +301,7 @@
                          if (!running || routeGeneration != generation) return@calculate
                          result.fold(onSuccess = { route ->
                              val observedDemand = newer.demand
-@@ -390,9 +447,19 @@
+@@ -390,9 +448,19 @@
          } else panel.showWaiting()
      }
      override fun onInterrupt(){}

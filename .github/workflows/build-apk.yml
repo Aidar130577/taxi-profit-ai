@@ -167,24 +167,6 @@ jobs:
       - name: Assemble test APK
         working-directory: android-project
         run: gradle --no-daemon --stacktrace :app:assembleDebug
-      - name: Check emulator support
-        id: emulator
-        run: |
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::This runner has no KVM; Android 14 connection test is skipped."
-          fi
-      - name: Verify accessibility service on Android 14
-        if: steps.emulator.outputs.available == 'true'
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
-        with:
-          api-level: 34
-          arch: x86_64
-          target: google_apis
-          disable-animations: true
-          script: bash patches/test_accessibility_connection.sh
       - name: Verify packaged launcher icon
         shell: bash
         run: |
@@ -205,3 +187,28 @@ jobs:
           path: ZnayTsenu-v30.apk
           retention-days: 7
           if-no-files-found: error
+
+  accessibility:
+    name: Calculator overlay on Android API ${{ matrix.api }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [28, 34, 36]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ZnayTsenu-v30-branded-apk
+      - name: Enable hardware virtualization
+        run: sudo chmod 666 /dev/kvm
+      - name: Test service and calculator overlay
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: ${{ matrix.api }}
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash patches/test_accessibility_connection.sh ZnayTsenu-v30.apk
