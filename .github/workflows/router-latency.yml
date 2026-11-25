@@ -1,5 +1,7 @@
 name: BRouter v45 isolated latency benchmark
 on:
+  pull_request:
+    branches: [fix/v45-route-diagnostics]
   push:
     branches: [test/v45-router-latency]
     paths: ['.github/workflows/router-latency.yml']
