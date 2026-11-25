@@ -98,6 +98,7 @@ jobs:
           python3 ../patches/window_ocr_v21.py
           python3 ../patches/purple_demand_v22.py
           python3 ../patches/accept_bar_v23.py
+          python3 ../patches/calculator_overlay_v24.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -119,7 +120,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 23').replace('0.17.0-approved-overlays', '0.23.0-accept-bar'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 24').replace('0.17.0-approved-overlays', '0.24.0-calculator'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -142,12 +143,13 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
-      - name: Test surcharge evidence
+      - name: Test surcharge evidence and offer display state
         working-directory: android-project
         run: |
           command -v kotlinc
-          kotlinc app/src/main/java/kz/taxiprofitai/Engine.kt app/src/main/java/kz/taxiprofitai/CommissionCatalog.kt app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt core-tests/OfferDemandCheck.kt -include-runtime -d /tmp/offer-demand.jar
-          java -jar /tmp/offer-demand.jar
+          kotlinc app/src/main/java/kz/taxiprofitai/Engine.kt app/src/main/java/kz/taxiprofitai/CommissionCatalog.kt app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/OfferPopupState.kt core-tests/OfferDemandCheck.kt core-tests/OfferPopupCheck.kt -include-runtime -d /tmp/offer-demand.jar
+          java -cp /tmp/offer-demand.jar kz.taxiprofitai.OfferDemandCheckKt
+          java -cp /tmp/offer-demand.jar kz.taxiprofitai.OfferPopupCheckKt
       - name: Assemble test APK
         working-directory: android-project
         run: gradle --no-daemon --stacktrace :app:assembleDebug
@@ -156,16 +158,16 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='23'" apk-badging.txt
+          grep -q "versionCode='24'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
-          cp "$APK" TaxiProfitAI-v23.apk
+          cp "$APK" TaxiProfitAI-v24.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: TaxiProfitAI-v23-branded-apk
-          path: TaxiProfitAI-v23.apk
+          name: TaxiProfitAI-v24-branded-apk
+          path: TaxiProfitAI-v24.apk
           retention-days: 7
           if-no-files-found: error
