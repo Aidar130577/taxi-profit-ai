@@ -209,12 +209,20 @@ jobs:
           unzip -l "$APK" | grep "assets/brouter/E75_N40.rd5"
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | tee apk-signing.txt
+          if grep -qi "04162fe59988fd0c7317d04295d30a96d60a11c71f60e9c9e00cf71f8cf1c582" apk-signing.txt; then
+            echo "v42 certificate matches: in-place update candidate" | tee upgrade-compatibility.txt
+          else
+            echo "WARNING: v42 certificate differs; do not uninstall v42 or claim a safe upgrade" | tee upgrade-compatibility.txt
+          fi
           cp "$APK" ZnayTsenu-v43.apk
       - uses: actions/upload-artifact@v4
         with:
           name: ZnayTsenu-v43-branded-apk
-          path: ZnayTsenu-v43.apk
+          path: |
+            ZnayTsenu-v43.apk
+            apk-signing.txt
+            upgrade-compatibility.txt
           retention-days: 7
           if-no-files-found: error
 
