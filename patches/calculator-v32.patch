@@ -177,7 +177,7 @@
      }
  
      fun samePoint(known: String, candidate: String): Boolean {
-@@ -261,10 +296,17 @@
+@@ -261,10 +296,18 @@
          }
          val (a, b) = if (isOrder) routePoints(addresses, cardOnly) else null to null
          val acceptIndex = addresses.indexOfLast { it.contains("Принять", true) }
@@ -191,25 +191,26 @@
 +            acceptCoefficient.find(own)?.groupValues?.get(1)?.replace(',', '.')?.toDoubleOrNull()
 +                ?: adjacent?.let { acceptCoefficient.find(it)?.groupValues?.get(1)?.replace(',', '.')?.toDoubleOrNull() }
 +        } else null
++        val visibleCoefficient = coefficient?.takeIf { it in 1.0..20.0 }
 +        val pickupFees = if (isOrder) pickupExtras(addresses) else emptyList()
 +        val excludedRows = pickupFees.map { it.first }.toSet()
 +        val demandText = addresses.filterIndexed { index, _ -> index !in excludedRows }.joinToString("\n")
 +        val demand = if (isOrder) OfferDemandEvidence.direct(demandText) ?: OfferDemandEvidence.acceptButton(demandText)
-+            ?: Demand(DemandType.NONE, verified = true).takeIf { coefficient == 1.0 } else d
++            ?: Demand(DemandType.NONE, verified = true).takeIf { visibleCoefficient == 1.0 } else d
          val approachKm = pm?.let { match ->
              match.groupValues[1].replace(",", ".").toDoubleOrNull()?.let { kmOrMetres ->
                  if (match.groupValues[2].equals("м", ignoreCase = true)) kmOrMetres / 1000 else kmOrMetres
-@@ -273,7 +315,8 @@
+@@ -273,7 +316,8 @@
          return Detected(isOrder, tariff, demand, t.contains("аэропорт",true), a,b,
              approachKm, pm?.groupValues?.get(3)?.toIntOrNull(),
              t.contains("Очень высокий спрос",true) && t.contains("Комиссия снижена",true),
 -            if (isOrder && tariff != null) visibleFare(addresses) else null)
 +            if (isOrder && tariff != null) visibleFare(addresses) else null,
-+            pickupFees.map { it.second }.distinct().singleOrNull(), coefficient)
++            pickupFees.map { it.second }.distinct().singleOrNull(), visibleCoefficient)
      }
  }
  
-@@ -301,9 +344,10 @@
+@@ -301,9 +345,10 @@
      fun calculateWithCommission(rate:TariffRate, route:OfflineRoute, demand:Demand,
                                  yandexPct:Double?, parkPct:Double,
                                  loyaltyDiscountPoints:Double=0.0,
@@ -543,7 +544,7 @@
 +                                        paidPickupConfirmed = newer.pickupExtra != null))
                              }.getOrNull()
 -                            val fixed = when (observedDemand?.type) {
-+                            val fixed = when (observedDemand?.type.takeUnless { newer.pickupExtra != null }) {
++                            val fixed = if (newer.pickupExtra != null) null else when (observedDemand?.type) {
                                  DemandType.NONE -> 0.0
                                  DemandType.FIXED_ADD -> observedDemand.amount.takeIf { observedDemand.verified }
                                  else -> null
@@ -585,16 +586,24 @@
                                  else -> "Офлайн BRouter • без живых пробок"
                              }
                          }, onFailure = {
-@@ -467,13 +494,13 @@
-                 when(it.type){
-                     DemandType.FIXED_ADD -> "+${it.amount.toInt()} ₸"
-                     DemandType.MULTIPLIER -> "×${it.amount}"
+@@ -463,17 +490,17 @@
+     private fun render() {
+         val panel = popup ?: return
+         if (detected.order && offerPopupState.shouldShow()) {
+-            val demand=detected.demand?.let {
+-                when(it.type){
+-                    DemandType.FIXED_ADD -> "+${it.amount.toInt()} ₸"
+-                    DemandType.MULTIPLIER -> "×${it.amount}"
 -                    else -> "+0 ₸"
 -                }
 -            } ?: "спрос —"
-+                    else -> null
-+                }
-+            } ?: detected.observedCoefficient?.let { "×" + String.format(java.util.Locale.ROOT, "%.2f", it) } ?: "—"
++            val baseDemand = detected.demand
++            val coefficient = detected.observedCoefficient
++                ?: baseDemand?.takeIf { it.type == DemandType.MULTIPLIER }?.amount
++            val coefficientText = coefficient?.let { "×" + String.format(java.util.Locale.ROOT, "%.2f", it) }
++            val surchargeText = baseDemand?.takeIf { it.type == DemandType.FIXED_ADD }
++                ?.let { "+${FareEngine.kzt(it.amount)}" }
++            val demand = listOfNotNull(coefficientText, surchargeText).joinToString(" ").ifBlank { "—" }
              panel.showQuote(detected.tariff?.let {TarifCatalog.shortName(it)} ?: "Заказ",
                  demand,estimate,routeStatus,
                  detected.tariff?.let {TarifCatalog.rateExpired(it)} ?: TarifCatalog.expiredToday(),
