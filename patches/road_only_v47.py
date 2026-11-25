@@ -120,7 +120,7 @@ s, count = re.subn(r'(text\(c,title,[^,\n]+,[^,\n]+,)\d+(?:\.\d+)?f', r'\g<1>22f
 assert count == 1, "Expected one tariff header draw call"
 
 # Day mode restores the original dark panel; night mode uses light cyan
-# against the dark map, with saturated high-contrast lettering.
+# against the dark map, with the same text colors as day mode (user approved).
 anchor = "        paint.color = Color.rgb(22, 32, 39)"
 assert s.count(anchor) == 1
 a = s.index("    override fun onDraw(c:Canvas){")
@@ -132,10 +132,10 @@ draw = re.sub(r'\bgreen\b', 'panelGreen', draw)
 draw = re.sub(r'\bpurple\b', 'panelPurple', draw)
 draw = draw.replace(anchor, """        val nightMap = context.getSharedPreferences("taxi_profit_settings", android.content.Context.MODE_PRIVATE)
             .getBoolean("overlay_night_map", true)
-        val panelInk = if (nightMap) Color.rgb(8, 34, 78) else Color.WHITE
-        val panelGold = if (nightMap) Color.rgb(151, 72, 0) else yellow
-        val panelGreen = if (nightMap) Color.rgb(0, 104, 49) else green
-        val panelPurple = if (nightMap) Color.rgb(112, 0, 190) else purple
+        val panelInk = Color.WHITE
+        val panelGold = yellow
+        val panelGreen = green
+        val panelPurple = purple
         paint.color = if (nightMap) Color.rgb(186, 242, 255) else Color.rgb(22, 32, 39)""")
 draw = draw.replace("        paint.color = panelGold\n        c.drawRoundRect", "        paint.color = if (nightMap) Color.rgb(0, 83, 212) else yellow\n        c.drawRoundRect")
 s = s[:a] + draw + s[b:]
