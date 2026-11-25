@@ -100,23 +100,9 @@ s = s.replace(anchor, """    private val compactAmountPaint = Paint(Paint.ANTI_A
     }
 
 """ + anchor)
-# Keep the existing tariff codes, not the full English names. Display only;
-# fare lookup continues to use the original detected tariff.
+# Keep the existing tariff codes, not the full English names.
 import re
-s, count = re.subn(r'(?m)^        title=when\(tariff\)\{[^\n]+\} existing text() width fitting
-# keeps long tariff names, surcharges and high-value amounts inside the panel.
-import re
-s, count = re.subn(r'(text\(c,title,[^,\n]+,[^,\n]+,)\d+(?:\.\d+)?f', r'\g<1>22f', s)
-assert count == 1, "Expected one tariff header draw call"
-p.write_text(s)
-
-p = root / "RadarAccessibilityService.kt"
-s = p.read_text()
-assert s.count("minOf(dp(240), screenWidth())") == 1
-s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(144), screenWidth())")
-p.write_text(s)
-print("Compact overlay: 144dp wide, 57.6dp fare height, 22.8dp waiting height; status only for missing fare.")
-, '''        title = "Тариф " + when (tariff.trim().uppercase(java.util.Locale.ROOT)) {
+s, count = re.subn(r'(?m)^        title=when\(tariff\)\{[^\n]+\}$', lambda m: '''        title = "Тариф " + when (tariff.trim().uppercase(java.util.Locale.ROOT)) {
             "EK", "ЕК", "ECONOMY", "ЭКОНОМ" -> "EK"
             "K", "К", "COMFORT", "КОМФОРТ" -> "K"
             "K+", "К+", "COMFORT+", "КОМФОРТ+" -> "K+"
@@ -126,11 +112,16 @@ print("Compact overlay: 144dp wide, 57.6dp fare height, 22.8dp waiting height; s
             else -> tariff.trim()
         }''', s)
 assert count == 1, "Expected original tariff title mapping"
-# Match the header and amount nominal font sizes; existing text() width fitting
-# keeps long tariff names, surcharges and high-value amounts inside the panel.
-import re
 s, count = re.subn(r'(text\(c,title,[^,\n]+,[^,\n]+,)\d+(?:\.\d+)?f', r'\g<1>22f', s)
 assert count == 1, "Expected one tariff header draw call"
+
+# Manual contrast theme. Read the saved setting on each draw, so changing
+# it takes effect on the next render without changing the system theme.
+anchor = "        paint.color = Color.rgb(22, 32, 39)"
+assert s.count(anchor) == 1
+s = s.replace(anchor, """        val nightMap = context.getSharedPreferences("taxi_profit_settings", android.content.Context.MODE_PRIVATE)
+            .getBoolean("overlay_night_map", true)
+        paint.color = if (nightMap) Color.rgb(72, 86, 99) else Color.rgb(22, 32, 39)""")
 p.write_text(s)
 
 p = root / "RadarAccessibilityService.kt"
@@ -138,4 +129,19 @@ s = p.read_text()
 assert s.count("minOf(dp(240), screenWidth())") == 1
 s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(144), screenWidth())")
 p.write_text(s)
-print("Compact overlay: 152dp wide, 51.9dp fare height, 24.1dp waiting height; status only for missing fare.")
+
+p = root / "MainActivity.kt"
+s = p.read_text()
+anchor = "        root.addView(setupButton,LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,dp(48)))"
+assert s.count(anchor) == 1
+s = s.replace(anchor, '''        val nightMapButton = action(if (prefs.getBoolean("overlay_night_map", true))
+            "Плашка: ночной режим" else "Плашка: дневной режим") { }
+        nightMapButton.setOnClickListener {
+            val night = !prefs.getBoolean("overlay_night_map", true)
+            prefs.edit().putBoolean("overlay_night_map", night).apply()
+            nightMapButton.text = if (night) "Плашка: ночной режим" else "Плашка: дневной режим"
+        }
+        root.addView(nightMapButton)
+''' + anchor)
+p.write_text(s)
+print("Compact overlay: 144dp x 57.6dp; night-map slate / day-map dark; persistent manual toggle.")
