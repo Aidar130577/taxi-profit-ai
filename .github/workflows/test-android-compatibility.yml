@@ -1,0 +1,58 @@
+name: Verify Android compatibility
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/test-android-compatibility.yml]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Build APK workflow run to verify
+        required: true
+        default: '45567191299'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  accessibility:
+    name: Service connection on API ${{ matrix.api }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [28, 36]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check emulator support
+        id: emulator
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::This runner has no KVM for the Android emulator."
+          fi
+      - name: Download the exact v0.30 APK
+        if: steps.emulator.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK_RUN_ID: ${{ inputs.run_id || '45567191299' }}
+        run: |
+          for attempt in {1..28}; do
+            if gh run download "$APK_RUN_ID" --pattern 'ZnayTsenu-*-branded-apk' --dir apk; then
+              mkdir -p android-project/app/build/outputs/apk/debug
+              cp apk/*.apk android-project/app/build/outputs/apk/debug/app-debug.apk
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+      - name: Verify service enable, disable and reconnect
+        if: steps.emulator.outputs.available == 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: ${{ matrix.api }}
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash patches/test_accessibility_connection.sh
