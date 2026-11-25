@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-package=kz.taxiprofitai
-activity="$package/.MainActivity"
-service="$package/$package.RadarAccessibilityService"
+package=${2:-kz.taxiprofitai}
+activity="$package/kz.taxiprofitai.MainActivity"
+service="$package/kz.taxiprofitai.RadarAccessibilityService"
 driver_package=ru.yandex.taximeter
 log_tag=ZnayTsenuService
 api=$(adb shell getprop ro.build.version.sdk)
