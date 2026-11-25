@@ -15,7 +15,7 @@ edit(p,'    fun route(fromLat: Double, fromLon: Double, toLat: Double, toLon: Do
 edit(p,'        val routing = context()\n        val engine = RoutingEngine',
 '''        val routing = context(shortest)
         val engine = RoutingEngine''')
-edit(p,'        engine.doRun(2_000)','        engine.doRun(if (shortest) 4_000 else 2_000)')
+edit(p,'        engine.doRun(2_000)','        engine.doRun(if (shortest) 3_000 else 2_000)')
 edit(p,'return OfflineRoute(result.distance / 1000.0, result.totalSeconds / 60.0,\n            geometry = points,',
 '''return OfflineRoute(result.distance / 1000.0, result.totalSeconds / 60.0,
             source = if (shortest) "BRouter · минимум км" else "BRouter · обычный профиль",
