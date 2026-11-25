@@ -153,15 +153,36 @@ echo "Service connection, overlay and reconnect verified on API $api"
 
 # Simulate Android losing the application process, without rebooting the emulator.
 # A genuine reconnect must redraw the overlay with the saved shift flag.
-old_pid=$(adb shell pidof "$package" | tr -d '\r')
-test -n "$old_pid"
+# The emulator shell runs as root for this targeted test. Android 10 may
+# hide PIDs from run-as; acquire and kill the live PID in the same shell.
+# Require a successful kill, a new PID, a fresh service bind and overlay.
 adb logcat -c
-adb shell run-as "$package" kill -9 "$old_pid"
+old_pid=""
+for attempt in {1..8}; do
+    killed=$(adb shell "p=\$(pidof '$package'); set -- \$p; [ \$# -eq 1 ] && kill -9 \$1 && echo \$1" 2>/dev/null | tr -d '\r' || true)
+    if [[ "$killed" =~ ^[0-9]+$ ]]; then
+        old_pid="$killed"
+        break
+    fi
+    sleep 1
+done
+if [[ -z "$old_pid" ]]; then
+    diagnostics
+    echo "Unable to prove termination of the live app process" >&2
+    exit 1
+fi
+echo "Successfully killed live app PID $old_pid on API $api"
 wait_for_log "Accessibility service connected"
 wait_for_log "Order overlay attached"
 new_pid=$(adb shell pidof "$package" | tr -d '\r')
 test -n "$new_pid"
 test "$old_pid" != "$new_pid"
+# Verify the post-kill overlay and connection were logged by the new process.
+adb logcat -d --pid="$new_pid" -s "$log_tag:V" > "$test_dir/recovered.log"
+grep -F "Accessibility service connected" "$test_dir/recovered.log"
+grep -F "Order overlay attached" "$test_dir/recovered.log"
+adb shell dumpsys accessibility | grep 'Bound services:' | grep 'Знай цену' >/dev/null
+echo "Recovery verified: $old_pid -> $new_pid"
 echo "Calculator restored after process death without reboot on API $api"
 
 

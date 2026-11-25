@@ -1,0 +1,38 @@
+name: Android 10 recovery only - existing v46 APK
+on:
+  push:
+    branches: [test/v46-api29-recovery]
+    paths: ['.github/workflows/api29-recovery.yml', 'ci/test_accessibility_connection.sh']
+  pull_request:
+    branches: [test/v46-road-apk]
+    paths: ['.github/workflows/api29-recovery.yml', 'ci/test_accessibility_connection.sh']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  api29:
+    name: Android 10 recovery on original v46 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download exact previously built APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api /repos/Aidar130577/taxi-profit-ai/actions/artifacts/15065292164/zip > /tmp/v46-roadtest.zip
+          unzip -o /tmp/v46-roadtest.zip
+          test -s ZnayTsenu-v46-roadtest.apk
+          sha256sum ZnayTsenu-v46-roadtest.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs ZnayTsenu-v46-roadtest.apk
+      - name: Enable hardware virtualization
+        run: sudo chmod 666 /dev/kvm
+      - name: Test API 29 only
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 29
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: adb root && adb wait-for-device && test "$(adb shell id -u | tr -d '\r')" = 0 && bash ci/test_accessibility_connection.sh ZnayTsenu-v46-roadtest.apk kz.taxiprofitai.roadtest
