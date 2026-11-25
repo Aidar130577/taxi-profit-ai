@@ -1,0 +1,30 @@
+name: Check Android Settings switch
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/check-accessibility-settings.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  android-settings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ZnayTsenu-v32-branded-apk
+          run-id: 45612363957
+          github-token: ${{ github.token }}
+      - name: Enable hardware virtualization
+        run: sudo chmod 666 /dev/kvm
+      - name: Enable the service through the Android Settings interface
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash settings-check/android-switch.sh ZnayTsenu-v32.apk
