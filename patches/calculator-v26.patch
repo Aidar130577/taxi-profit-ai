@@ -1,0 +1,58 @@
+--- a/app/src/main/java/kz/taxiprofitai/Engine.kt
++++ b/app/src/main/java/kz/taxiprofitai/Engine.kt
+@@ -165,7 +165,7 @@
+         val t = text.replace('\u00a0',' ')
+         val isOrder = t.contains("Принять",true) &&
+             (Regex("Пропустить",RegexOption.IGNORE_CASE).containsMatchIn(t) || t.contains("подача",true))
+-        val tariff = TarifCatalog.titles.sortedByDescending { it.length }.firstOrNull { name ->
++        val explicitTariff = TarifCatalog.titles.sortedByDescending { it.length }.firstOrNull { name ->
+             Regex("(?<![\\p{L}])"+Regex.escape(name)+"(?![\\p{L}])", RegexOption.IGNORE_CASE).containsMatchIn(t)
+         }
+         // Priority +1 (radar icon) is NOT an increase in fare.
+@@ -173,6 +173,14 @@
+             ?: mult.find(t)?.groupValues?.get(1)?.replace(",",".")?.toDoubleOrNull()?.let { Demand(DemandType.MULTIPLIER,it,true) }
+         val pm = pickup.find(t)
+         val addresses = t.lines().map { it.trim() }.filter { it.isNotBlank() }
++        val unsupported = excludedOrder.containsMatchIn(t)
++        // Other passenger tariffs also display this label; it only fills an absent tariff.
++        val tariff = when {
++            unsupported -> null
++            explicitTariff != null -> explicitTariff
++            isOrder && addresses.any { it.equals("Пассажир", ignoreCase = true) } -> "Электро"
++            else -> null
++        }
+         fun extract(marker: String): String? {
+             // Yandex accessibility trees may expose the marker as a separate node.
+             val i = addresses.indexOfFirst { it == marker || it.startsWith("$marker ") || it.startsWith("$marker:") }
+@@ -192,10 +200,10 @@
+         val fallback=candidates.takeIf{it.size==2 && isOrder}
+         val a = extract("А") ?: extract("A") ?: fallback?.get(0)
+         val b = extract("Б") ?: extract("B") ?: fallback?.get(1)
+-        return Detected(isOrder,if(excludedOrder.containsMatchIn(t)) null else tariff,if(isOrder)OfferDemandEvidence.direct(t) ?: OfferDemandEvidence.acceptButton(t) else d,t.contains("аэропорт",true), a,b,
++        return Detected(isOrder,tariff,if(isOrder)OfferDemandEvidence.direct(t) ?: OfferDemandEvidence.acceptButton(t) else d,t.contains("аэропорт",true), a,b,
+             pm?.groupValues?.get(1)?.replace(",",".")?.toDoubleOrNull(), pm?.groupValues?.get(2)?.toIntOrNull(),
+             t.contains("Очень высокий спрос",true) && t.contains("Комиссия снижена",true),
+-            if (isOrder && tariff != null && !excludedOrder.containsMatchIn(t)) visibleFare(addresses) else null)
++            if (isOrder && tariff != null) visibleFare(addresses) else null)
+     }
+ }
+ 
+--- a/core-tests/LocalFareLearningCheck.kt
++++ b/core-tests/LocalFareLearningCheck.kt
+@@ -34,5 +34,15 @@
+     check(OrderTextParser.parse(offer.replace("Пропустить", "")).displayedGross == null)
+     check(OrderTextParser.parse(offer + "\nЦена: 2 000 ₸").displayedGross == null)
+     check(NetQuotePresenter.present(LiveFareEstimate(3000.0, 2394.0, 0.0, 0.0, "Карточка", fromOrder=true), 1.0).grossText == "3 000 ₸")
+-    println("15 local learning and visible fare checks passed")
++    val ev = "Пропустить\nБлижняя подача\nА: Абая, 10\nБ: Достык, 50\nПассажир\nСтоимость поездки: 3 000 ₸\nПринять"
++    val detectedEv = OrderTextParser.parse(ev)
++    check(detectedEv.tariff == "Электро" && detectedEv.displayedGross == 3000.0)
++    check(detectedEv.pickup == "Абая, 10" && detectedEv.destination == "Достык, 50")
++    check(OrderTextParser.parse(ev.replace("Пассажир", "Комфорт+\nПассажир")).tariff == "Комфорт+")
++    check(OrderTextParser.parse(ev.replace("Пассажир", "Premier\nПассажир")).tariff == "Premier")
++    check(OrderTextParser.parse(ev.replace("Пассажир", "Доставка\nПассажир")).tariff == null)
++    check(OrderTextParser.parse("Пассажир").tariff == null)
++    check(OrderTextParser.parse(ev.replace("Пассажир", "Позвонить пассажиру")).tariff == null)
++    check(TarifCatalog.forName(detectedEv.tariff)?.let { FareEngine.base(it, RouteEstimate(3.0, 7.0)) } == 1_005.0)
++    println("23 local learning, visible fare and EV recognition checks passed")
+ }
