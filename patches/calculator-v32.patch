@@ -1,0 +1,973 @@
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -1,6 +1,10 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+     <uses-permission android:name="android.permission.INTERNET"/>
++    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
++    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+     <!-- Android 11+ package visibility: query only the optional open-source BRouter package. -->
+     <queries><package android:name="btools.routingapp"/></queries>
+     <application android:allowBackup="false" android:label="@string/app_name" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:supportsRtl="true">
+@@ -10,6 +14,7 @@
+         <activity android:name=".MainActivity" android:exported="true">
+             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+         </activity>
++        <service android:name=".RideGpsService" android:exported="false" android:foregroundServiceType="location"/>
+         <service android:name=".RadarAccessibilityService" android:exported="true" android:label="@string/accessibility_service_name" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+             <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+             <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_service_config"/>
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/CityWeather.kt
+@@ -0,0 +1,77 @@
++package kz.taxiprofitai
++
++import android.content.Context
++import org.json.JSONObject
++import java.net.URL
++import java.time.Instant
++import java.util.concurrent.Executors
++import javax.net.ssl.HttpsURLConnection
++
++/** Requests only fixed Almaty city coordinates. Cached forecasts never contain driver locations. */
++object CityWeather {
++    const val ENABLED = "weather_almaty_enabled"
++    const val TERMS = "https://docs.api.met.no/doc/TermsOfService.html"
++    private const val CITY_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=43.24&lon=76.95"
++    private val worker = Executors.newSingleThreadExecutor()
++    private var inFlight = false
++
++    fun condition(context: Context, now: Long): RideWeather {
++        if (!context.getSharedPreferences("taxi_profit_settings", Context.MODE_PRIVATE).getBoolean(ENABLED, false)) {
++            return RideWeather.UNKNOWN
++        }
++        val cache = context.getSharedPreferences("almaty_weather_cache", Context.MODE_PRIVATE)
++        val raw = cache.getString("forecast", null)
++        if (now >= cache.getLong("expires", 0L)) refresh(context.applicationContext)
++        return raw?.let { parse(it, now) } ?: RideWeather.UNKNOWN
++    }
++
++    @Synchronized private fun refresh(context: Context) {
++        if (inFlight) return
++        inFlight = true
++        worker.execute {
++            try {
++                val cache = context.getSharedPreferences("almaty_weather_cache", Context.MODE_PRIVATE)
++                val now = System.currentTimeMillis()
++                if (now < cache.getLong("expires", 0L)) return@execute
++                val conn = URL(CITY_URL).openConnection() as HttpsURLConnection
++                try {
++                    conn.connectTimeout = 6_000
++                    conn.readTimeout = 6_000
++                    conn.setRequestProperty("User-Agent", "ZnayTsenu/0.32 (https://github.com/Aidar130577)")
++                    val prior = cache.getLong("lastModified", 0L)
++                    if (prior > 0) conn.ifModifiedSince = prior
++                    val code = conn.responseCode
++                    val expires = maxOf(now + 30 * 60_000L, conn.expiration)
++                    val edit = cache.edit().putLong("expires", expires)
++                    if (code == 200 || code == 203) {
++                        val data = conn.inputStream.bufferedReader().use { it.readText() }
++                        if (data.length <= 1_500_000) {
++                            edit.putString("forecast", data).putLong("lastModified", conn.lastModified)
++                        }
++                    }
++                    edit.apply()
++                } finally {
++                    conn.disconnect()
++                }
++            } catch (_: Exception) {
++                context.getSharedPreferences("almaty_weather_cache", Context.MODE_PRIVATE).edit()
++                    .putLong("expires", System.currentTimeMillis() + 30 * 60_000L).apply()
++            } finally {
++                synchronized(this) { inFlight = false }
++            }
++        }
++    }
++
++    private fun parse(data: String, now: Long): RideWeather = runCatching {
++        val times = JSONObject(data).getJSONObject("properties").getJSONArray("timeseries")
++        for (index in 0 until times.length()) {
++            val entry = times.getJSONObject(index)
++            val time = Instant.parse(entry.getString("time")).toEpochMilli()
++            if (now - time !in 0L until 3_600_000L) continue
++            val near = entry.getJSONObject("data").optJSONObject("next_1_hours")
++                ?.optJSONObject("summary")?.optString("symbol_code").orEmpty()
++            return RideWeather.fromSymbol(near)
++        }
++        RideWeather.UNKNOWN
++    }.getOrDefault(RideWeather.UNKNOWN)
++}
+--- a/app/src/main/java/kz/taxiprofitai/Engine.kt
++++ b/app/src/main/java/kz/taxiprofitai/Engine.kt
+@@ -145,7 +145,8 @@
+ object OrderTextParser {
+     data class Detected(val order: Boolean, val tariff: String?, val demand: Demand?, val airport: Boolean,
+                         val pickup: String?, val destination: String?, val pickupKm: Double?, val pickupMin: Int?,
+-                        val verifiedHighDemandDiscount: Boolean = false, val displayedGross: Double? = null)
++                        val verifiedHighDemandDiscount: Boolean = false, val displayedGross: Double? = null,
++                        val pickupExtra: Long? = null, val observedCoefficient: Double? = null)
+     private val fixed = Regex("\\+\\s*(\\d[\\d\\s]*)\\s*[₸Т](?!\\w)", RegexOption.IGNORE_CASE)
+     private val mult = Regex("[×xх]\\s*(\\d+[,.]\\d+)", RegexOption.IGNORE_CASE)
+     private val pickup = Regex("""(?iu)(\d+(?:[,.]\d+)?)\s*(км|м)\s*[·•.\-]\s*(\d+)\s*мин""")
+@@ -173,7 +174,21 @@
+         """(?iu)^(?:пассажир|принять|пропустить|оплата|наличные|картой|подача|ближняя подача|дальняя подача|без надбавки|ожидание|комментарий|приоритет|спрос)\b"""
+     )
+ 
+-    private val neutralBoost = Regex("""(?iu)(?<![\p{L}\d])[×xх]\s*1[.,]0{1,2}(?![\d.,])""")
++    private val acceptCoefficient = Regex("""(?iu)(?<![\p{L}\d])[×xх]\s*(\d+[.,]\d{1,2})(?![\d.,])""")
++    private val standaloneCoefficient = Regex("""(?iu)^\s*[×xх]\s*\d+[.,]\d{1,2}\s*[⚡]?\s*$""")
++    private val longPickup = Regex("""(?iu)^\s*(?:дальняя\s+подача|доплата\s+за\s+дальнюю\s+подачу)\s*[:—–]?\s*(.*)$""")
++    private val pickupMoney = Regex("""(?iu)^\s*\+?\s*(\d{1,3}(?:[ \u202f]\d{3})+|\d{1,6})\s*(?:₸|тенге|тг\.?)\s*$""")
++
++    private fun pickupExtras(lines: List<String>): List<Pair<Int, Long>> =
++        lines.mapIndexedNotNull { index, line ->
++            val suffix = longPickup.matchEntire(line)?.groupValues?.get(1) ?: return@mapIndexedNotNull null
++            val amountIndex = if (suffix.isBlank()) index + 1 else index
++            val raw = suffix.ifEmpty { lines.getOrNull(amountIndex).orEmpty() }
++            val amount = pickupMoney.matchEntire(raw)?.groupValues?.get(1)?.filter(Char::isDigit)
++                ?.toLongOrNull()?.takeIf { it in 1L..100_000L } ?: return@mapIndexedNotNull null
++            amountIndex to amount
++        }
++
+     private val excludedOrder = Regex("(?iu)(?<![\\p{L}])(доставка|курьер|грузовой|яндекс\\s+еда|межгород|вместе)(?![\\p{L}])")
+     private val displayedFare = Regex(
+         """(?iu)^\s*(?:стоимость(?:\s+поездки)?|цена(?:\s+поездки)?|сумма\s+заказа)\s*[:—–-]?\s*(\d{1,3}(?:[ \u202f]\d{3})+|\d{1,6})(?:[,.](\d{1,2}))?\s*(?:₸|тенге|тг\.?)\s*$"""
+@@ -202,13 +217,13 @@
+ 
+     private fun isRouteLine(line: String): Boolean = line.length in 3..160 && line.any(Char::isLetter) &&
+         !offerMetadata.containsMatchIn(line) && !driverLocation.containsMatchIn(line) &&
+-        !unavailable.containsMatchIn(line) && !mapCoordinate.matches(line) && !displayedFare.matches(line) &&
++        !unavailable.containsMatchIn(line) && !mapCoordinate.matches(line) && !displayedFare.matches(line) && !pickupMoney.matches(line) &&
+         pointLine(line) == null && TarifCatalog.titles.none { it.equals(line, true) }
+ 
+     private fun routePoints(lines: List<String>, cardOnly: Boolean): Pair<String?, String?> {
+         val accept = lines.indexOfLast { it.contains("Принять", true) }
+         if (accept < 0) return null to null
+-        val header = lines.take(accept).indexOfLast { cardHeader.containsMatchIn(it) }
++        val header = lines.take(accept).indexOfFirst { cardHeader.containsMatchIn(it) }
+             .takeIf { it >= 0 } ?: lines.take(accept).indexOfLast { pickup.containsMatchIn(it) }
+         if (header < 0) return null to null
+         val body = lines.subList(header + 1, accept).takeWhile { !cardFooter.containsMatchIn(it) }
+@@ -232,6 +247,26 @@
+         val from = explicitPickup ?: probablePickup
+         val to = explicitDestination ?: unmarked.getOrNull(1)?.takeIf { probablePickup != null && unmarked.size == 2 }
+         return from to to?.takeUnless { from != null && it.equals(from, true) }
++    }
++
++    fun rideObservation(text: String): Pair<RidePhase, List<String>> {
++        val lines = text.replace('\u00a0', ' ').lines().map(String::trim).filter(String::isNotEmpty)
++        fun has(vararg labels: String) = lines.any { row -> labels.any { row.equals(it, true) } }
++        val phase = when {
++            has("Заказ отменён", "Заказ отменен", "Поездка отменена") -> RidePhase.CANCELLED
++            has("Поездка завершена", "Заказ завершён", "Заказ завершен", "Заказ выполнен") -> RidePhase.COMPLETED
++            has("Завершить", "Завершить поездку") && has("Пассажир", "Ожидание") -> RidePhase.ACTIVE
++            has("Начать поездку") -> RidePhase.READY
++            else -> RidePhase.OTHER
++        }
++        val points = if (phase == RidePhase.ACTIVE || phase == RidePhase.READY) {
++            lines.mapIndexedNotNull { index, line ->
++                val mark = pointLine(line) ?: return@mapIndexedNotNull null
++                if (mark.first != Point.DESTINATION) return@mapIndexedNotNull null
++                mark.second.ifEmpty { lines.getOrNull(index + 1).orEmpty() }.takeIf(::isRouteLine)
++            }.distinct()
++        } else emptyList()
++        return phase to points
+     }
+ 
+     fun samePoint(known: String, candidate: String): Boolean {
+@@ -261,10 +296,17 @@
+         }
+         val (a, b) = if (isOrder) routePoints(addresses, cardOnly) else null to null
+         val acceptIndex = addresses.indexOfLast { it.contains("Принять", true) }
+-        // A multiplier of exactly one on the accept control is a confirmed absence of extra demand.
+-        val noIncrease = acceptIndex >= 0 && addresses.drop(acceptIndex).take(2).any(neutralBoost::containsMatchIn)
+-        val demand = if (isOrder) OfferDemandEvidence.direct(t) ?: OfferDemandEvidence.acceptButton(t)
+-            ?: Demand(DemandType.NONE, verified = true).takeIf { noIncrease } else d
++        val coefficient = if (isOrder && acceptIndex >= 0) {
++            val own = addresses[acceptIndex]
++            val adjacent = addresses.getOrNull(acceptIndex + 1)?.takeIf(standaloneCoefficient::matches)
++            acceptCoefficient.find(own)?.groupValues?.get(1)?.replace(',', '.')?.toDoubleOrNull()
++                ?: adjacent?.let { acceptCoefficient.find(it)?.groupValues?.get(1)?.replace(',', '.')?.toDoubleOrNull() }
++        } else null
++        val pickupFees = if (isOrder) pickupExtras(addresses) else emptyList()
++        val excludedRows = pickupFees.map { it.first }.toSet()
++        val demandText = addresses.filterIndexed { index, _ -> index !in excludedRows }.joinToString("\n")
++        val demand = if (isOrder) OfferDemandEvidence.direct(demandText) ?: OfferDemandEvidence.acceptButton(demandText)
++            ?: Demand(DemandType.NONE, verified = true).takeIf { coefficient == 1.0 } else d
+         val approachKm = pm?.let { match ->
+             match.groupValues[1].replace(",", ".").toDoubleOrNull()?.let { kmOrMetres ->
+                 if (match.groupValues[2].equals("м", ignoreCase = true)) kmOrMetres / 1000 else kmOrMetres
+@@ -273,7 +315,8 @@
+         return Detected(isOrder, tariff, demand, t.contains("аэропорт",true), a,b,
+             approachKm, pm?.groupValues?.get(3)?.toIntOrNull(),
+             t.contains("Очень высокий спрос",true) && t.contains("Комиссия снижена",true),
+-            if (isOrder && tariff != null) visibleFare(addresses) else null)
++            if (isOrder && tariff != null) visibleFare(addresses) else null,
++            pickupFees.map { it.second }.distinct().singleOrNull(), coefficient)
+     }
+ }
+ 
+@@ -301,9 +344,10 @@
+     fun calculateWithCommission(rate:TariffRate, route:OfflineRoute, demand:Demand,
+                                 yandexPct:Double?, parkPct:Double,
+                                 loyaltyDiscountPoints:Double=0.0,
+-                                verifiedHighDemandBanner:Boolean=false):LiveFareEstimate {
++                                verifiedHighDemandBanner:Boolean=false,
++                                extras: ConfirmedExtras = ConfirmedExtras()):LiveFareEstimate {
+         require(demand.type != DemandType.MULTIPLIER || (demand.verified && demand.amount>=1.0))
+-        val parts=FareEngine.detailed(rate,RouteEstimate(route.km,route.minutes),demand)
++        val parts=FareEngine.detailed(rate,RouteEstimate(route.km,route.minutes),demand,extras)
+         val commission=CommissionCatalog.calculate(parts.gross,parts.ride,yandexPct,parkPct,
+             loyaltyDiscountPoints,verifiedHighDemandBanner)
+         return LiveFareEstimate(parts.gross,commission.net,route.km,route.minutes,route.source,commission)
+--- a/app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt
++++ b/app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt
+@@ -16,7 +16,11 @@
+     val latencyMs: Long? = null,
+     val fixedSurcharge: Double? = null,
+     val tariffRevision: String? = null,
+-    val learningDay: LocalDate? = null
++    val learningDay: LocalDate? = null,
++    val offlineMinutes: Double? = null,
++    val actualMinutes: Double? = null,
++    val actualKm: Double? = null,
++    val weather: RideWeather = RideWeather.UNKNOWN
+ )
+ 
+ /** Adapts the v4 temporal validation to one driver's confirmed trips. */
+--- a/app/src/main/java/kz/taxiprofitai/MainActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/MainActivity.kt
+@@ -127,6 +127,7 @@
+         }
+         root.addView(stop)
+         root.addView(action("История прогнозов"){ showLearningHistory() })
++        root.addView(action("GPS и погода"){ showTripSensors() })
+         if (android.os.Build.VERSION.SDK_INT >= 34) {
+             root.addView(action("Распознавание адресов"){ showOcrSettings() })
+         }
+@@ -156,6 +157,8 @@
+             return
+         }
+         fun start(){
++            startTripGps()
++            CityWeather.condition(this, System.currentTimeMillis())
+             prefs.edit().putBoolean("shift_active",true).apply()
+             updatePermission()
+             moveTaskToBack(true)
+@@ -222,18 +225,81 @@
+             .show()
+     }
+ 
++    private fun startTripGps() {
++        if (prefs.getBoolean("ride_gps_enabled", false) &&
++            checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
++                android.content.pm.PackageManager.PERMISSION_GRANTED) {
++            runCatching { startForegroundService(Intent(this, RideGpsService::class.java)) }
++        }
++    }
++
++    private fun showTripSensors() {
++        val gpsEnabled = prefs.getBoolean("ride_gps_enabled", false)
++        val weatherEnabled = prefs.getBoolean(CityWeather.ENABLED, false)
++        android.app.AlertDialog.Builder(this)
++            .setTitle("GPS и погода")
++            .setItems(arrayOf(
++                if (gpsEnabled) "Выключить GPS поездок" else "Включить GPS поездок",
++                if (weatherEnabled) "Выключить прогноз погоды" else "Включить прогноз погоды"
++            )) { _, index ->
++                if (index == 0 && gpsEnabled) {
++                    prefs.edit().putBoolean("ride_gps_enabled", false).apply()
++                    RideGpsService.stop(this)
++                } else if (index == 0) {
++                    android.app.AlertDialog.Builder(this)
++                        .setTitle("GPS поездок")
++                        .setMessage("Во время поездки GPS измеряет расстояние. В истории остаются только километры и время. Координаты не сохраняются и не отправляются.")
++                        .setNegativeButton("Отмена", null)
++                        .setPositiveButton("Разрешить") { _, _ ->
++                            requestPermissions(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION,
++                                android.Manifest.permission.ACCESS_COARSE_LOCATION), 40)
++                        }.show()
++                } else if (weatherEnabled) {
++                    prefs.edit().putBoolean(CityWeather.ENABLED, false).apply()
++                } else {
++                    android.app.AlertDialog.Builder(this)
++                        .setTitle("Прогноз погоды для Алматы")
++                        .setMessage("Источник MET Norway, CC BY 4.0. Запрос использует координаты центра Алматы. MET Norway получает IP-адрес при запросе. Прочитай условия перед включением.")
++                        .setNeutralButton("Условия и лицензия") { _, _ ->
++                            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(CityWeather.TERMS)))
++                        }
++                        .setNegativeButton("Отмена", null)
++                        .setPositiveButton("Принимаю и включаю") { _, _ ->
++                            prefs.edit().putBoolean(CityWeather.ENABLED, true).apply()
++                            CityWeather.condition(this, System.currentTimeMillis())
++                        }.show()
++                }
++            }
++            .setNegativeButton("Закрыть", null)
++            .show()
++    }
++
++    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
++        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
++        if (requestCode == 40 && checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
++            android.content.pm.PackageManager.PERMISSION_GRANTED) {
++            prefs.edit().putBoolean("ride_gps_enabled", true).apply()
++            if (prefs.getBoolean("shift_active", false)) startTripGps()
++        }
++    }
++
+     private fun showLearningHistory() {
+-        val rows = TrialStore.read(this).filter { it.fixedSurcharge != null && it.tariffRevision != null }
++        val rows = TrialStore.read(this)
+         val dialog = android.app.AlertDialog.Builder(this)
+             .setTitle("История прогнозов")
+             .setNegativeButton("Закрыть", null)
+         if (rows.isEmpty()) {
+-            dialog.setMessage("Здесь появятся прогнозы для заказов с известной надбавкой. После поездки добавь полную стоимость из Яндекс Про.")
++            dialog.setMessage("Здесь будут прогнозы и фактическое время поездок. Время можно добавить вручную, если приложение не увидело начало или завершение.")
+         } else {
+             val format = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
+             val labels = rows.map { row ->
+-                val actual = row.actualGross?.let { "Факт ${FareEngine.kzt(it)}" } ?: "Добавить факт"
+-                "${format.format(java.util.Date(row.createdAtMs))} · ${row.tariff}\nПрогноз ${FareEngine.kzt(row.forecastGross)} · $actual"
++                val actual = row.actualMinutes?.let { minutes ->
++                    val speed = (row.actualKm ?: row.km) * 60 / minutes
++                    val mark = if (row.actualKm == null) "≈" else ""
++                    "${"%.1f".format(minutes)} мин · $mark${"%.0f".format(speed)} км/ч"
++                } ?: "Добавить факт"
++                val gross = row.actualGross?.let { "Факт ${FareEngine.kzt(it)}" } ?: ""
++                "${format.format(java.util.Date(row.createdAtMs))} · ${row.tariff}\nПрогноз ${FareEngine.kzt(row.forecastGross)} · $actual $gross".trimEnd()
+             }.toTypedArray()
+             dialog.setItems(labels) { _, index -> confirmTrip(rows[index]) }
+         }
+@@ -245,15 +311,18 @@
+             orientation = LinearLayout.VERTICAL
+             setPadding(dp(20), dp(8), dp(20), 0)
+         }
+-        val amount = EditText(this).apply {
+-            hint = "Полная стоимость поездки, ₸"
++        fun number(caption: String, current: Double?) = EditText(this).apply {
++            hint = caption
+             inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+-            setText(row.actualGross?.toString().orEmpty())
+-        }
++            setText(current?.toString().orEmpty())
++            form.addView(this)
++        }
++        val minutes = number("Фактическое время, мин", row.actualMinutes)
++        val km = number("Фактическое расстояние, км (если известно)", row.actualKm)
++        val amount = number("Полная стоимость, ₸ (если известна)", row.actualGross)
+         val comparable = CheckBox(this).apply {
+-            text = "Маршрут не менялся. Сумма без чаевых и дополнительных начислений."
+-        }
+-        form.addView(amount)
++            text = "Маршрут не менялся. Если указана сумма, она без чаевых и доплат."
++        }
+         form.addView(comparable)
+         val dialog = android.app.AlertDialog.Builder(this)
+             .setTitle("Подтвердить завершённую поездку")
+@@ -263,12 +332,24 @@
+             .create()
+         dialog.setOnShowListener {
+             dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+-                val value = amount.text.toString().trim().replace(',', '.').toDoubleOrNull()
+-                if (value == null || !value.isFinite() || value <= 0 || value > 100_000) {
+-                    amount.error = "Укажи полную стоимость от 0 до 100 000 ₸"
++                fun read(field: EditText, range: ClosedFloatingPointRange<Double>): Double? {
++                    val text = field.text.toString().trim()
++                    if (text.isEmpty()) return null
++                    val value = text.replace(',', '.').toDoubleOrNull()?.takeIf { it in range }
++                    if (value == null) field.error = "Введи число от ${range.start} до ${range.endInclusive}"
++                    return value
++                }
++                val timeValue = read(minutes, 2.0..240.0)
++                val distanceValue = read(km, 0.1..300.0)
++                val priceValue = read(amount, 1.0..100_000.0)
++                if ((minutes.text.isNotBlank() && timeValue == null) ||
++                    (km.text.isNotBlank() && distanceValue == null) ||
++                    (amount.text.isNotBlank() && priceValue == null)) return@setOnClickListener
++                if (timeValue == null && priceValue == null) {
++                    minutes.error = "Укажи время или стоимость"
+                 } else if (!comparable.isChecked) {
+-                    Toast.makeText(this, "Подтверди, что поездка сопоставима с прогнозом", Toast.LENGTH_LONG).show()
+-                } else if (TrialStore.setActual(this, row.id, value)) {
++                    Toast.makeText(this, "Подтверди, что маршрут не менялся", Toast.LENGTH_LONG).show()
++                } else if (TrialStore.saveActual(this, row.id, priceValue, timeValue, distanceValue)) {
+                     dialog.dismiss()
+                     showLearningHistory()
+                 }
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
+@@ -18,8 +18,9 @@
+     private var waiting = true
+     private var pickup: String? = null
+     private var destination: String? = null
++    private var pickupExtra: Long? = null
+     private val showAddresses get() = pickup != null || destination != null
+-    private val logicalHeight get() = if (waiting) 38 else if (showAddresses) 134 else 104
++    private val logicalHeight get() = if (waiting) 38 else (if (showAddresses) 134 else 104) + if (pickupExtra != null) 18 else 0
+ 
+     init {
+         isClickable = true
+@@ -74,18 +75,25 @@
+             text(c, "Б  ${destination ?: "—"}", 7f, 103f, 11f, Color.WHITE, false, Paint.Align.LEFT, 225f)
+             line(c,108f)
+         }
+-        text(c,footer,120f,if (showAddresses) 126f else 96f,14f,Color.WHITE,false,Paint.Align.CENTER,228f)
++        var footerY = if (showAddresses) 126f else 96f
++        pickupExtra?.let {
++            text(c, "Дальняя подача +${FareEngine.kzt(it.toDouble())}", 120f, footerY, 13f,
++                Color.WHITE, true, Paint.Align.CENTER, 228f)
++            footerY += 18f
++        }
++        text(c,footer,120f,footerY,14f,Color.WHITE,false,Paint.Align.CENTER,228f)
+         c.restore()
+     }
+     fun showQuote(tariff:String,demand:String,estimate:LiveFareEstimate?,status:String,ratesExpired:Boolean,
+-                  parkPct:Double, pickupAddress:String?, destinationAddress:String?){
++                  parkPct:Double, pickupAddress:String?, destinationAddress:String?, paidPickup: Long?){
+         val oldHeight = logicalHeight
+         pickup = pickupAddress
+         destination = destinationAddress
++        pickupExtra = paidPickup
+         waiting = false
+         if (logicalHeight != oldHeight) requestLayout()
+         title=when(tariff){"BS"->"Business BS";"EK"->"Economy EK";"K"->"Comfort K";"K+"->"Comfort K+";"EV"->"Electric EV";"PR"->"Premier PR";else->tariff}
+-        demandText=if(demand.startsWith("+"))demand else "—"
++        demandText=demand
+         footer=when {
+             status.startsWith("Надбавка неизвестна") -> "База · надбавка неизвестна"
+             status.startsWith("Надбавка") -> "Не считана надбавка"
+@@ -93,7 +101,7 @@
+             status.startsWith("Адрес не найден") || status == "Уточните название места" -> status
+             status.startsWith("Нет маршрута") -> "Нет маршрута BRouter"
+             status.startsWith("Маршрут") -> "Считаем…"
+-            status == "Учтён опыт поездок" -> status
++            status == "Учтён опыт поездок" || status == "Время скорректировано" -> status
+             status == "База комиссии неизвестна" -> status
+             ratesExpired && estimate != null && !estimate.fromOrder -> "Исторические ставки"
+             else -> "Нажмите, чтобы свернуть"
+@@ -102,7 +110,8 @@
+         gross="СТОИМОСТЬ ${quote.grossText}${if(ratesExpired && estimate!=null && !estimate.fromOrder)"*" else ""}"
+         net="НА РУКИ ${quote.takeHomeText}"
+         val route = if (showAddresses) "А: ${pickup ?: "—"}. Б: ${destination ?: "—"}." else ""
+-        contentDescription="$title $demandText. $gross. $net. $route $status. Нажмите, чтобы свернуть."
++        val pickupFeeText = pickupExtra?.let { "Дальняя подача +${FareEngine.kzt(it.toDouble())}." }.orEmpty()
++        contentDescription="$title $demandText. $gross. $net. $route $pickupFeeText $status. Нажмите, чтобы свернуть."
+         invalidate()
+     }
+ }
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -47,6 +47,7 @@
+     private var verifiedAt=0L
+     private var lastScan = 0L
+     private var routeGeneration = 0L
++    private val rideTiming = RideTiming()
+     private var loggedOffer = false
+     private var loggedIdentity: String? = null
+     private var windowChangedSinceScan = false
+@@ -120,6 +121,8 @@
+ 
+     private fun stopShift() {
+         running = false
++        rideTiming.reset()
++        RideGpsService.stop(this)
+         cancelScan()
+         windowChangedSinceScan = false
+         ocrEpoch++
+@@ -143,7 +146,7 @@
+             PixelFormat.TRANSLUCENT
+         ).apply { gravity = Gravity.TOP or Gravity.START }
+         val maxX = (screenWidth() - layout.width).coerceAtLeast(0)
+-        val maxY = (screenHeight() - dp(142)).coerceAtLeast(0)
++        val maxY = (screenHeight() - dp(152)).coerceAtLeast(0)
+         layout.x = prefs.getInt("calculator_x", ((screenWidth() - layout.width) / 2)).coerceIn(0, maxX)
+         layout.y = prefs.getInt("calculator_y", dp(96)).coerceIn(0, maxY)
+         val slop = ViewConfiguration.get(this).scaledTouchSlop
+@@ -284,6 +287,12 @@
+         }
+         walk(root, 0)
+         val visible = texts.distinct().joinToString("\n")
++        val (ridePhase, destinations) = OrderTextParser.rideObservation(visible)
++        rideTiming.observe(ridePhase, destinations, lastScan)?.let { fact ->
++            TrialStore.saveActual(this, fact.rowId, minutes = fact.minutes,
++                km = RideGpsService.distanceKm(fact.minutes), automatic = true)
++        }
++        RideGpsService.record(rideTiming.active)
+         val screen = OrderTextParser.parse(visible)
+         val isolatedCard = card
+         val native = when {
+@@ -336,9 +345,12 @@
+                                 pickup = original.pickup ?: candidate.pickup.takeIf { candidate.order && sameDestination },
+                                 destination = original.destination ?: candidate.destination.takeIf { candidate.order && samePickup },
+                                 tariff = original.tariff ?: candidate.tariff,
+-                                displayedGross = original.displayedGross ?: candidate.displayedGross.takeIf { candidate.order }
++                                displayedGross = original.displayedGross ?: candidate.displayedGross.takeIf { candidate.order },
++                                pickupExtra = original.pickupExtra ?: candidate.pickupExtra.takeIf { candidate.order },
++                                observedCoefficient = original.observedCoefficient ?: candidate.observedCoefficient.takeIf { candidate.order }
+                             ) else candidate
+-                            val demand=OfferDemandEvidence.merge(original.demand ?: candidate.demand,reading.purple)
++                            val purple = reading.purple?.takeUnless { it == merged.pickupExtra }
++                            val demand=OfferDemandEvidence.merge(original.demand ?: candidate.demand,purple)
+                             if (!merged.order || merged.tariff == null || (demand == null && merged.displayedGross == null &&
+                                     (merged.pickup == null || merged.destination == null))) return@post
+                             if(original.tariff!=null && original.tariff!=merged.tariff)return@post
+@@ -373,7 +385,7 @@
+             offerPopupState.observe(true, identity)
+             detected=newer
+             // Trigger once per unique visible order; do not re-geocode on each accessibility event.
+-            val key="${newer.pickup}|${newer.destination}|${newer.tariff}|${newer.demand}|${newer.displayedGross}|${newer.verifiedHighDemandDiscount}|${newer.tariff?.let{CommissionSettings.percent(prefs,it)}}|${CommissionSettings.loyalty(prefs)}|${CommissionSettings.park(prefs)}"
++            val key="${newer.pickup}|${newer.destination}|${newer.tariff}|${newer.demand}|${newer.displayedGross}|${newer.pickupExtra}|${newer.verifiedHighDemandDiscount}|${newer.tariff?.let{CommissionSettings.percent(prefs,it)}}|${CommissionSettings.loyalty(prefs)}|${CommissionSettings.park(prefs)}"
+             if(key!=routeKey){
+                 routeKey=key;estimate=null
+                 val generation = ++routeGeneration
+@@ -404,27 +416,41 @@
+                         result.fold(onSuccess = { route ->
+                             val observedDemand = newer.demand
+                             val demand = observedDemand ?: Demand(DemandType.NONE)
++                            val history = TrialStore.read(this)
++                            val now = System.currentTimeMillis()
++                            val weather = CityWeather.condition(this, now)
++                            val minutes = RideTimeLearning.estimate(route, history, now, weather)
++                            val timedRoute = route.copy(minutes = minutes)
++                            val timeAdjusted = kotlin.math.abs(minutes - route.minutes) >= 0.01
+                             val raw = runCatching {
+-                                RouteFareEstimator.calculateWithCommission(rate, route, demand, yandex, park,
+-                                    loyalty, newer.verifiedHighDemandDiscount)
++                                RouteFareEstimator.calculateWithCommission(rate, timedRoute, demand, yandex, park,
++                                    loyalty, newer.verifiedHighDemandDiscount,
++                                    ConfirmedExtras(pickupCharge = newer.pickupExtra?.toDouble() ?: 0.0,
++                                        paidPickupConfirmed = newer.pickupExtra != null))
+                             }.getOrNull()
+-                            val fixed = when (observedDemand?.type) {
++                            val fixed = when (observedDemand?.type.takeUnless { newer.pickupExtra != null }) {
+                                 DemandType.NONE -> 0.0
+                                 DemandType.FIXED_ADD -> observedDemand.amount.takeIf { observedDemand.verified }
+                                 else -> null
+                             }
+-                            val factor = if (raw != null && fixed != null) LocalFareLearning.correction(
+-                                TrialStore.read(this), rate.title, TarifCatalog.lastVerified, raw.km, raw.minutes,
++                            val factor = if (raw != null && fixed != null && !timeAdjusted) LocalFareLearning.correction(
++                                history, rate.title, TarifCatalog.lastVerified, raw.km, raw.minutes,
+                                 fixed, TrialStore.cityDay()
+                             ) else 1.0
+                             estimate = raw
++                            if (raw != null && !loggedOffer) {
++                                val label = when {
++                                    fixed == null -> "Надбавка не подтверждена"
++                                    fixed > 0.0 -> "+${fixed.toInt()} ₸"
++                                    else -> "Без надбавки"
++                                }
++                                val elapsed = android.os.SystemClock.elapsedRealtime()
++                                val rowId = TrialStore.append(this, rate.title, raw, label,
++                                    elapsed - calcStartedAt, fixed, route.minutes, weather)
++                                rideTiming.offer(rowId, newer.destination, elapsed)
++                                loggedOffer = true
++                            }
+                             if (raw != null && fixed != null) {
+-                                if (!loggedOffer) {
+-                                    val label = if (fixed > 0.0) "+${fixed.toInt()} ₸" else "Без надбавки"
+-                                    TrialStore.append(this, rate.title, raw, label,
+-                                        android.os.SystemClock.elapsedRealtime() - calcStartedAt, fixed)
+-                                    loggedOffer = true
+-                                }
+                                 if (factor != 1.0) {
+                                     val gross = LocalFareLearning.apply(raw.gross, fixed, factor)
+                                     val commission = CommissionCatalog.calculate(gross, gross - fixed, yandex,
+@@ -436,6 +462,7 @@
+                                 raw == null -> "Ошибка тарифной модели"
+                                 observedDemand == null -> "Надбавка неизвестна"
+                                 factor != 1.0 -> "Учтён опыт поездок"
++                                timeAdjusted -> "Время скорректировано"
+                                 else -> "Офлайн BRouter • без живых пробок"
+                             }
+                         }, onFailure = {
+@@ -467,13 +494,13 @@
+                 when(it.type){
+                     DemandType.FIXED_ADD -> "+${it.amount.toInt()} ₸"
+                     DemandType.MULTIPLIER -> "×${it.amount}"
+-                    else -> "+0 ₸"
+-                }
+-            } ?: "спрос —"
++                    else -> null
++                }
++            } ?: detected.observedCoefficient?.let { "×" + String.format(java.util.Locale.ROOT, "%.2f", it) } ?: "—"
+             panel.showQuote(detected.tariff?.let {TarifCatalog.shortName(it)} ?: "Заказ",
+                 demand,estimate,routeStatus,
+                 detected.tariff?.let {TarifCatalog.rateExpired(it)} ?: TarifCatalog.expiredToday(),
+-                CommissionSettings.park(prefs), detected.pickup, detected.destination)
++                CommissionSettings.park(prefs), detected.pickup, detected.destination, detected.pickupExtra)
+         } else panel.showWaiting()
+     }
+     override fun onInterrupt(){}
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/RideGpsService.kt
+@@ -0,0 +1,117 @@
++package kz.taxiprofitai
++
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ServiceInfo
++import android.location.Location
++import android.location.LocationListener
++import android.location.LocationManager
++import android.os.Build
++import android.os.Bundle
++import android.os.IBinder
++import android.os.SystemClock
++
++/** Keeps permission while Yandex Pro is in front. Fixes are collected only during a detected ride. */
++class RideGpsService : Service(), LocationListener {
++    companion object {
++        private const val CHANNEL = "ride_gps"
++        private var current: RideGpsService? = null
++        fun record(active: Boolean) { current?.recordRide(active) }
++        fun distanceKm(minutes: Double): Double? = current?.measuredDistance(minutes)
++        fun stop(context: Context) { context.stopService(Intent(context, RideGpsService::class.java)) }
++    }
++
++    private lateinit var locations: LocationManager
++    private var recording = false
++    private var prior: Location? = null
++    private var firstFix = 0L
++    private var samples = 0
++    private var totalMetres = 0.0
++    private var gaps = false
++
++    override fun onCreate() {
++        super.onCreate()
++        locations = getSystemService(LocationManager::class.java)
++        getSystemService(NotificationManager::class.java).createNotificationChannel(
++            NotificationChannel(CHANNEL, "GPS поездок", NotificationManager.IMPORTANCE_LOW)
++        )
++    }
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        val notice = Notification.Builder(this, CHANNEL)
++            .setContentTitle("Знай цену · GPS поездок")
++            .setContentText("Расстояние измеряется во время поездки")
++            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
++            .setOngoing(true)
++            .build()
++        try {
++            if (Build.VERSION.SDK_INT >= 29) startForeground(4701, notice, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
++            else startForeground(4701, notice)
++            current = this
++        } catch (_: SecurityException) {
++            stopSelf()
++        }
++        return START_NOT_STICKY
++    }
++
++    fun recordRide(active: Boolean) {
++        if (active == recording) return
++        recording = active
++        if (!active) {
++            locations.removeUpdates(this)
++            return
++        }
++        prior = null
++        firstFix = 0L
++        totalMetres = 0.0
++        samples = 0
++        gaps = false
++        try {
++            locations.requestLocationUpdates(LocationManager.GPS_PROVIDER, 2_000L, 0f, this, mainLooper)
++        } catch (_: SecurityException) {
++            recording = false
++        } catch (_: IllegalArgumentException) {
++            recording = false
++        }
++    }
++
++    override fun onLocationChanged(location: Location) {
++        if (!recording || location.isFromMockProvider || !location.hasAccuracy() || location.accuracy > 25f) return
++        val time = location.elapsedRealtimeNanos
++        if (SystemClock.elapsedRealtimeNanos() - time !in 0L..10_000_000_000L) return
++        val old = prior
++        if (old == null) {
++            firstFix = time
++        } else {
++            val seconds = (time - old.elapsedRealtimeNanos) / 1_000_000_000.0
++            if (seconds <= 0) return
++            val metres = old.distanceTo(location).toDouble()
++            if (seconds > 45 || metres / seconds > 55) gaps = true
++            else if (metres >= 5 && (!location.hasSpeed() || location.speed >= 0.8f)) totalMetres += metres
++        }
++        prior = location
++        samples++
++    }
++
++    private fun measuredDistance(minutes: Double): Double? {
++        val last = prior ?: return null
++        val coverage = (last.elapsedRealtimeNanos - firstFix) / 60_000_000_000.0
++        return (totalMetres / 1000).takeIf { recording && !gaps && samples >= 5 &&
++            coverage >= minutes * 0.8 && it in 0.2..300.0 }
++    }
++
++    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
++    override fun onProviderEnabled(provider: String) = Unit
++    override fun onProviderDisabled(provider: String) { if (recording) gaps = true }
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onDestroy() {
++        if (current === this) current = null
++        recordRide(false)
++        super.onDestroy()
++    }
++}
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt
+@@ -0,0 +1,104 @@
++package kz.taxiprofitai
++
++import java.time.Instant
++import java.time.ZoneId
++
++enum class RideWeather {
++    UNKNOWN, DRY, RAIN, SNOW;
++
++    companion object {
++        fun fromSymbol(symbol: String): RideWeather = when {
++            symbol.isBlank() -> UNKNOWN
++            "snow" in symbol || "sleet" in symbol -> SNOW
++            "rain" in symbol -> RAIN
++            else -> DRY
++        }
++    }
++}
++
++/** Learns duration from comparable completed routes on this phone. */
++object RideTimeLearning {
++    private val city = ZoneId.of("Asia/Almaty")
++    private val retention = 45L * 24 * 60 * 60 * 1000
++
++    fun estimate(route: OfflineRoute, rows: List<LocalTrial>, now: Long, weather: RideWeather = RideWeather.UNKNOWN): Double {
++        val local = Instant.ofEpochMilli(now).atZone(city)
++        val base = if (local.hour in 6..22) maxOf(route.minutes, route.km * 2) else route.minutes
++        val similar = rows.filter { row ->
++            val minutes = row.actualMinutes
++            val sourceMinutes = row.offlineMinutes ?: row.minutes
++            val trip = Instant.ofEpochMilli(row.createdAtMs).atZone(city)
++            row.createdAtMs in (now - retention)..now && period(local.hour, local.minute) == period(trip.hour, trip.minute) && row.weather == weather &&
++                row.km in (route.km * 0.55)..(route.km * 1.8) &&
++                (row.actualKm == null || row.actualKm in (row.km * 0.75)..(row.km * 1.25)) &&
++                sourceMinutes > 0 && minutes != null && minutes in 2.0..240.0 &&
++                minutes / sourceMinutes in 0.45..3.0
++        }.distinctBy { it.id }.take(50)
++        if (similar.size < 5 || similar.map {
++                Instant.ofEpochMilli(it.createdAtMs).atZone(city).toLocalDate()
++            }.distinct().size < 2) return base
++
++        val ratios = similar.map { it.actualMinutes!! / (it.offlineMinutes ?: it.minutes) }.sorted()
++        val ratio = (ratios[(ratios.size - 1) / 2] + ratios[ratios.size / 2]) / 2
++        return (route.minutes * ratio).coerceIn(base * 0.75, base * 1.8)
++    }
++
++    private fun period(hour: Int, minute: Int): Int {
++        val clock = hour * 60 + minute
++        return when (clock) {
++            in 420 until 570 -> 1
++            in 1020 until 1260 -> 2
++            in 360 until 1380 -> 3
++            else -> 0
++        }
++    }
++}
++
++enum class RidePhase { READY, ACTIVE, COMPLETED, CANCELLED, OTHER }
++
++class RideTiming {
++    data class Fact(val rowId: Long, val minutes: Double)
++    private data class Offer(val id: Long, val destination: String, val elapsed: Long)
++    private var offer: Offer? = null
++    private var readyAt: Long? = null
++    private var startAt: Long? = null
++    val active get() = startAt != null
++
++    fun offer(id: Long, destination: String, elapsed: Long) {
++        if (offer?.id == id || startAt != null) return
++        reset()
++        offer = Offer(id, destination, elapsed)
++    }
++
++    fun observe(phase: RidePhase, destinations: List<String>, elapsed: Long): Fact? {
++        val current = offer ?: return null
++        val matches = destinations.any { OrderTextParser.samePoint(current.destination, it) }
++        when (phase) {
++            RidePhase.READY -> {
++                if (startAt != null) reset()
++                else if (matches && elapsed - current.elapsed in 0L..1_800_000L) readyAt = elapsed
++                else readyAt = null
++            }
++            RidePhase.ACTIVE -> {
++                val ready = readyAt
++                if (startAt == null && ready != null && matches && elapsed - ready in 0L..30_000L) {
++                    startAt = elapsed
++                } else if (startAt != null && destinations.isNotEmpty() && !matches) reset()
++            }
++            RidePhase.COMPLETED -> {
++                val minutes = startAt?.let { (elapsed - it) / 60_000.0 }
++                reset()
++                return minutes?.takeIf { it in 2.0..240.0 }?.let { Fact(current.id, it) }
++            }
++            RidePhase.CANCELLED -> reset()
++            RidePhase.OTHER -> Unit
++        }
++        return null
++    }
++
++    fun reset() {
++        offer = null
++        readyAt = null
++        startAt = null
++    }
++}
+--- a/app/src/main/java/kz/taxiprofitai/TrialStore.kt
++++ b/app/src/main/java/kz/taxiprofitai/TrialStore.kt
+@@ -31,7 +31,11 @@
+                     if (obj.has("latencyMs")) obj.getLong("latencyMs") else null,
+                     if (obj.has("surcharge")) obj.getDouble("surcharge") else null,
+                     if (obj.has("revision")) obj.getString("revision") else null,
+-                    if (obj.has("learningDay")) LocalDate.parse(obj.getString("learningDay")) else null
++                    if (obj.has("learningDay")) LocalDate.parse(obj.getString("learningDay")) else null,
++                    obj.optDouble("offlineMinutes").takeIf(Double::isFinite),
++                    obj.optDouble("actualMinutes").takeIf(Double::isFinite),
++                    obj.optDouble("actualKm").takeIf(Double::isFinite),
++                    RideWeather.entries.firstOrNull { it.name == obj.optString("weather") } ?: RideWeather.UNKNOWN
+                 )
+             }.getOrNull()
+             if (row != null && row.forecastGross.isFinite() && row.forecastGross >= 0) rows.add(row)
+@@ -40,24 +44,43 @@
+     }
+ 
+     @Synchronized fun append(context: Context, tariff: String, result: LiveFareEstimate,
+-                             demand: String, latencyMs: Long, fixedSurcharge: Double? = null): Long {
++                             demand: String, latencyMs: Long, fixedSurcharge: Double? = null,
++                             offlineMinutes: Double = result.minutes, weather: RideWeather = RideWeather.UNKNOWN): Long {
+         val now=System.currentTimeMillis()
+         val old=read(context)
+         val id = maxOf(now, (old.maxOfOrNull { it.id } ?: 0) + 1)
+         val row=LocalTrial(id,tariff,result.gross,result.km,result.minutes,now,demand,
+             latencyMs=latencyMs.coerceAtLeast(0L), fixedSurcharge=fixedSurcharge,
+-            tariffRevision=TarifCatalog.lastVerified.takeIf { fixedSurcharge != null })
++            tariffRevision=TarifCatalog.lastVerified.takeIf { fixedSurcharge != null },
++            offlineMinutes = offlineMinutes, weather = weather)
+         write(context,(listOf(row)+old).take(LIMIT))
+         return id
+     }
+ 
+-    @Synchronized fun setActual(context: Context, id: Long, amount: Double): Boolean {
+-        if (!amount.isFinite() || amount <= 0.0 || amount > 100_000) return false
+-        val old=read(context)
+-        if (old.none{it.id==id}) return false
+-        write(context,old.map {if(it.id==id) it.copy(actualGross=amount, learningDay=cityDay(it.createdAtMs)) else it})
++    fun setActual(context: Context, id: Long, amount: Double): Boolean =
++        saveActual(context, id, amount = amount)
++
++    @Synchronized fun saveActual(
++        context: Context, id: Long, amount: Double? = null, minutes: Double? = null,
++        km: Double? = null, automatic: Boolean = false
++    ): Boolean {
++        if (amount != null && amount !in 1.0..100_000.0) return false
++        if (minutes != null && minutes !in 2.0..240.0) return false
++        if (km != null && km !in 0.1..300.0) return false
++        if (amount == null && minutes == null && km == null) return false
++        val old = read(context)
++        val row = old.firstOrNull { it.id == id } ?: return false
++        if (automatic && row.actualMinutes != null) return false
++        val updated = row.copy(
++            actualGross = amount ?: row.actualGross,
++            actualMinutes = minutes ?: row.actualMinutes,
++            actualKm = km ?: row.actualKm,
++            learningDay = if (amount != null) cityDay(row.createdAtMs) else row.learningDay
++        )
++        write(context, old.map { if (it.id == id) updated else it })
+         return true
+     }
++
+     private fun write(context: Context, rows: List<LocalTrial>) {
+         val a=JSONArray()
+         for (r in rows.take(LIMIT)) {
+@@ -71,6 +94,10 @@
+             if (r.fixedSurcharge != null) j.put("surcharge",r.fixedSurcharge)
+             if (r.tariffRevision != null) j.put("revision",r.tariffRevision)
+             if (r.learningDay != null) j.put("learningDay",r.learningDay.toString())
++            if (r.offlineMinutes != null) j.put("offlineMinutes", r.offlineMinutes)
++            if (r.actualMinutes != null) j.put("actualMinutes", r.actualMinutes)
++            if (r.actualKm != null) j.put("actualKm", r.actualKm)
++            if (r.weather != RideWeather.UNKNOWN) j.put("weather", r.weather.name)
+             a.put(j)
+         }
+         context.getSharedPreferences(NAME,Context.MODE_PRIVATE).edit().putString(KEY,a.toString()).apply()
+--- /dev/null
++++ b/core-tests/RideTimeCheck.kt
+@@ -0,0 +1,61 @@
++package kz.taxiprofitai
++
++import java.time.Instant
++import kotlin.math.abs
++
++fun main() {
++    val day = Instant.parse("2026-11-25T03:00:00Z").toEpochMilli()
++    val route = OfflineRoute(13.75, 19.0)
++    check(RideTimeLearning.estimate(route, emptyList(), day) == 27.5)
++    check(RideTimeLearning.estimate(route, emptyList(), day + 17 * 3_600_000L) == 19.0)
++    val rows = List(5) { index ->
++        LocalTrial(index.toLong(), "Комфорт+", 2000.0, route.km, 27.5,
++            day - (index + 1) * 86_400_000L, "—",
++            offlineMinutes = 19.0, actualMinutes = 31.0, actualKm = 13.6, weather = RideWeather.RAIN)
++    }
++    check(abs(RideTimeLearning.estimate(route, rows, day, RideWeather.RAIN) - 31.0) < 0.01)
++    check(RideTimeLearning.estimate(route, rows, day, RideWeather.SNOW) == 27.5)
++    check(RideTimeLearning.estimate(route, rows, day + 90 * 60_000L, RideWeather.RAIN) == 27.5)
++    check(RideTimeLearning.estimate(route, rows.take(4), day, RideWeather.RAIN) == 27.5)
++    check(RideTimeLearning.estimate(route, rows.map { it.copy(actualKm = 30.0) }, day, RideWeather.RAIN) == 27.5)
++    check(RideWeather.fromSymbol("heavysnowshowers_day") == RideWeather.SNOW)
++    check(RideWeather.fromSymbol("lightrain") == RideWeather.RAIN)
++    check(RideWeather.fromSymbol("clearsky_day") == RideWeather.DRY)
++
++    val pickup = "Абая, 10"
++    val destination = "улица Карасай батыра, 60"
++    val ride = RideTiming()
++    fun observe(text: String, milliseconds: Long): RideTiming.Fact? {
++        val (phase, addresses) = OrderTextParser.rideObservation(text)
++        return ride.observe(phase, addresses, milliseconds)
++    }
++    val ready = "А: $pickup\nБ: $destination\nПассажир\nНачать поездку"
++    val active = "Б: $destination\nПассажир\nОжидание\nЗавершить"
++    ride.offer(1, destination, 1_000)
++    check(observe(ready, 20_000) == null)
++    check(observe(active, 22_000) == null && ride.active)
++    check(observe("Яндекс Про", 42_000) == null && ride.active)
++    check(observe("Поездка завершена", 22_000 + 28 * 60_000L) == RideTiming.Fact(1, 28.0))
++    check(observe("Поездка завершена", 22_000 + 28 * 60_000L) == null)
++    ride.offer(2, destination, 1_000)
++    observe(ready, 20_000)
++    observe(active, 22_000)
++    observe("Поездка отменена", 200_000)
++    check(observe("Поездка завершена", 201_000) == null)
++    ride.offer(3, destination, 1_000)
++    observe(ready, 20_000)
++    observe(active.replace(destination, "Достык, 10"), 22_000)
++    check(observe("Поездка завершена", 300_000) == null)
++
++    val offer = "Дальняя подача\nКомфорт+\nА: $pickup\nБ: $destination\nПассажир\nДальняя подача\n+250 ₸\nПринять\n×1.30"
++    val read = OrderTextParser.parse(offer)
++    check(read.order && read.pickup == pickup && read.destination == destination)
++    check(read.pickupExtra == 250L && read.observedCoefficient == 1.30 && read.demand == null)
++    check(OrderTextParser.parse(offer.replace("Дальняя подача\n+250 ₸", "Бонус +250 ₸")).pickupExtra == null)
++    val rate = TarifCatalog.forName(read.tariff)!!
++    val plain = RouteFareEstimator.calculateWithCommission(rate, route, Demand(DemandType.NONE), 19.2, 1.0)
++    val paid = RouteFareEstimator.calculateWithCommission(rate, route, Demand(DemandType.NONE), 19.2, 1.0,
++        extras = ConfirmedExtras(pickupCharge = 250.0, paidPickupConfirmed = true))
++    check(abs(paid.gross - plain.gross - 250.0) < 0.01)
++    println("Drive timing, time of day, weather and separate pickup fees passed")
++}
