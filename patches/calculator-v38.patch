@@ -26,7 +26,7 @@
 +        val known = identity
 +        val target = destination
 +        val different = if (known != null) stableIdentity != known
-+            else target != null && place != null && !OrderTextParser.samePoint(target, place)
++            else target == null || (place != null && !OrderTextParser.samePoint(target, place))
 +        if (different) clear()
 +        return different
 +    }
@@ -104,7 +104,7 @@
              progressEpoch++
              closeOffer()
              render()
-@@ -359,13 +373,19 @@
+@@ -359,13 +373,20 @@
          if (latestBadge?.first != identity) latestBadge = null
          val newer = current.copy(tripBadge = native.tripBadge ?: current.tripBadge ?: latestBadge?.second)
          val phase = TripProgressReader.read(visible, selectedRoutes.singleOrNull())
@@ -113,7 +113,8 @@
 -            if (savedQuote != null) processDetection(savedQuote, false, rememberIncoming = false)
 -            if (phase == null || (phase.selecting && phase.route == null) || (!phase.selecting && phase.gross == null)) {
 +        if (!newer.order || !acceptedFare.allowsIncoming(identity, newer.destination)) {
-+            if (ridePhase == RidePhase.READY || ridePhase == RidePhase.ACTIVE) {
++            if ((ridePhase == RidePhase.READY || ridePhase == RidePhase.ACTIVE) &&
++                (loggedIdentity != null || destinations.size == 1 || tripProgress.hasContext(now))) {
 +                beginAccepted(loggedIdentity, destinations.singleOrNull())
 +            }
 +            if (phase != null) handleTripProgress(phase)
@@ -129,7 +130,7 @@
          }
          val generation=++scanGeneration
          val incomplete = newer.tariff == null || (newer.displayedGross == null &&
-@@ -411,9 +431,7 @@
+@@ -411,9 +432,7 @@
                  if (progressOnly) {
                      if (progressGeneration == progressEpoch && currentNativeOffer?.order != true &&
                          (currentNativeText == visible || TripProgressReader.read(currentNativeText) != null)) {
@@ -140,7 +141,7 @@
                      }
                      return@post
                  }
-@@ -475,11 +493,36 @@
+@@ -475,11 +494,37 @@
              })
          } catch (_: Exception) { finished() }
      }
@@ -155,6 +156,7 @@
 +
 +    private fun handleTripProgress(progress: TripProgress) {
 +        val quote = tripProgress.update(progress, System.currentTimeMillis())
++        if (progress.selecting && quote == null) return
 +        val identity = quote?.let { OfferPopupState.identity(it.pickup, it.destination, it.tariff) }
 +        beginAccepted(identity ?: loggedIdentity, quote?.destination ?: progress.destination)
 +        if (progress.selecting || progress.gross == null || quote == null) return
@@ -177,7 +179,7 @@
                  val now = System.currentTimeMillis()
                  tripProgress.remember(newer, now)
                  progressEpoch++
-@@ -627,7 +670,9 @@
+@@ -627,7 +672,9 @@
  
      private fun render() {
          val panel = popup ?: return
