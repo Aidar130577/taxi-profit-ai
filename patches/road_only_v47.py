@@ -63,6 +63,18 @@ assert s.count("(240 * density).toInt()") == 1
 s = s.replace("(240 * density).toInt()", "(192 * density).toInt()")
 assert "if (logicalHeight != oldHeight) requestLayout()" in s
 assert s.index("hasQuote = estimate != null") < s.index("if (logicalHeight != oldHeight) requestLayout()")
+# Two equal columns: Yandex gross and take-home amount.
+a = s.index("        line(c,29f);text(c,gross,")
+b = s.index("        // Show a short explanation", a)
+s = s[:a] + """        line(c,29f)
+        paint.color = Color.WHITE
+        paint.strokeWidth = 1f
+        c.drawLine(120f, 34f, 120f, 76f, paint)
+        text(c,"Яндекс",60f,46f,18f,yellow,true,Paint.Align.CENTER,110f)
+        text(c,"На руки",180f,46f,18f,green,true,Paint.Align.CENTER,110f)
+        text(c,gross.removePrefix("СТОИМОСТЬ "),60f,70f,18f,yellow,true,Paint.Align.CENTER,110f,true)
+        text(c,net.removePrefix("НА РУКИ "),180f,70f,18f,green,true,Paint.Align.CENTER,110f,true)
+""" + s[b:]
 p.write_text(s)
 
 p = root / "RadarAccessibilityService.kt"
