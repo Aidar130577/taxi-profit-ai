@@ -488,7 +488,7 @@
 +++ b/app/src/main/res/values/strings.xml
 @@ -1 +1 @@
 -<resources><string name="app_name">Taxi Profit AI</string><string name="accessibility_description">Считывает видимый текст Яндекс Про и, только с отдельного согласия, распознаёт снимок окна на устройстве, показывает расчёт поездки. Не нажимает кнопки и не изменяет работу Яндекс Про.</string></resources>
-+<resources><string name="app_name">Знай цену</string><string name="accessibility_description">Считывает видимый текст Яндекс Про и, только с отдельного согласия, распознаёт снимок окна на устройстве, показывает расчёт поездки. Не нажимает кнопки и не изменяет работу Яндекс Про.</string></resources>
++<resources><string name="app_name">Знай цену</string><string name="accessibility_description">Считывает видимый текст Яндекс Про и, только с отдельного согласия, распознаёт снимок окна на устройстве, показывает расчёт поездки. Не нажимает кнопки и не изменяет работу Яндекс Про.</string><string name="accessibility_service_name">Знай цену — чтение карточки заказа</string></resources>
 --- /dev/null
 +++ b/core-tests/LocalFareLearningCheck.kt
 @@ -0,0 +1,38 @@
@@ -530,3 +530,22 @@
 +    check(NetQuotePresenter.present(LiveFareEstimate(3000.0, 2394.0, 0.0, 0.0, "Карточка", fromOrder=true), 1.0).grossText == "3 000 ₸")
 +    println("15 local learning and visible fare checks passed")
 +}
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -3,14 +3,14 @@
+     <uses-permission android:name="android.permission.INTERNET"/>
+     <!-- Android 11+ package visibility: query only the optional open-source BRouter package. -->
+     <queries><package android:name="btools.routingapp"/></queries>
+-    <application android:allowBackup="false" android:label="Taxi Profit AI" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:supportsRtl="true">
++    <application android:allowBackup="false" android:label="@string/app_name" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:supportsRtl="true">
+         <activity android:name=".BenchmarkActivity" android:exported="false"/>
+         <activity android:name=".RouteTestActivity" android:exported="false"/>
+         <activity android:name=".SimpleMapActivity" android:exported="false"/>
+         <activity android:name=".MainActivity" android:exported="true">
+             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+         </activity>
+-        <service android:name=".RadarAccessibilityService" android:exported="true" android:label="Taxi Profit AI — чтение карточки заказа" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
++        <service android:name=".RadarAccessibilityService" android:exported="true" android:label="@string/accessibility_service_name" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+             <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+             <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_service_config"/>
+         </service>

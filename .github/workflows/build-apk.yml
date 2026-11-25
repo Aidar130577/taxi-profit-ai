@@ -161,6 +161,7 @@ jobs:
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
           grep -q "versionCode='25'" apk-badging.txt
+          grep -q "application-label:'Знай цену'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
