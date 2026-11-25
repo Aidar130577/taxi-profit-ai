@@ -53,14 +53,14 @@ edit("RadarAccessibilityService.kt",
                         routeStatus = when {
                             route.provisional''',
     '''                        val combinedRoute = if (badgeQuote != null && badgeRoute != null)
-                            DualFareMean.combinedRoute(badgeRoute, route) else null
+                            DualFareMean.combinedRoute(badgeRoute, route, DualFareMean.fixedDemand(newer.demand)) else null
                         val mixed = combinedRoute?.let { hybrid ->
                             RouteFareEstimator.calculateWithCommission(rate, hybrid, demand, yandex, park,
                                 loyalty, newer.verifiedHighDemandDiscount, pickupExtras(newer))
                         } ?: quote
                         estimate = mixed
                         routeStatus = when {
-                            badgeQuote != null -> "Км Яндекса · среднее время"
+                            combinedRoute != null -> "Адаптивный анализатор цены"
                             route.provisional''')
 # Keep first quote for latency and audit, store the actual blended forecast separately.
 p = root / "RadarAccessibilityService.kt"
@@ -69,7 +69,8 @@ anchor = '''                        if (!route.provisional && loggedOffer && rou
 assert s.count(anchor) == 1
 s = s.replace(anchor, '''                        detected.trialId?.let { id ->
                             TrialStore.compareForecasts(this, id, badgeQuote?.gross, quote.gross,
-                                mixed.gross.takeIf { badgeQuote != null }, badgeRoute, route)
+                                mixed.gross.takeIf { combinedRoute != null }, badgeRoute, route, combinedRoute?.minutes,
+                                combinedRoute?.let { DualFareMean.yandexWeight(DualFareMean.fixedDemand(newer.demand)) })
                         }
 ''' + anchor)
 # Trace should show the actually presented price, not just road price.
@@ -83,7 +84,8 @@ edit("LocalFareLearning.kt", "    val provisional: Boolean = false\n)", """    v
     val combinedForecast: Double? = null,
     val initialBadgeKm: Double? = null,
     val initialBadgeMinutes: Double? = null,
-    val combinedMinutes: Double? = null
+    val combinedMinutes: Double? = null,
+    val yandexTimeWeight: Double? = null
 )""")
 edit("TrialStore.kt", '                    obj.optBoolean("provisional")\n', '''                    obj.optBoolean("provisional"),
                     obj.optDouble("yandexForecast").takeIf(Double::isFinite),
@@ -91,7 +93,8 @@ edit("TrialStore.kt", '                    obj.optBoolean("provisional")\n', '''
                     obj.optDouble("combinedForecast").takeIf(Double::isFinite),
                     obj.optDouble("initialBadgeKm").takeIf(Double::isFinite),
                     obj.optDouble("initialBadgeMinutes").takeIf(Double::isFinite),
-                    obj.optDouble("combinedMinutes").takeIf(Double::isFinite)
+                    obj.optDouble("combinedMinutes").takeIf(Double::isFinite),
+                    obj.optDouble("yandexTimeWeight").takeIf(Double::isFinite)
 ''')
 edit("TrialStore.kt", '            if (r.provisional) j.put("provisional", true)\n', '''            if (r.provisional) j.put("provisional", true)
             r.yandexForecast?.let { j.put("yandexForecast", it) }
@@ -100,9 +103,11 @@ edit("TrialStore.kt", '            if (r.provisional) j.put("provisional", true)
             r.initialBadgeKm?.let { j.put("initialBadgeKm", it) }
             r.initialBadgeMinutes?.let { j.put("initialBadgeMinutes", it) }
             r.combinedMinutes?.let { j.put("combinedMinutes", it) }
+            r.yandexTimeWeight?.let { j.put("yandexTimeWeight", it) }
 ''')
 edit("TrialStore.kt", "    @Synchronized fun observeMetered(context: Context, id: Long) {", '''    @Synchronized fun compareForecasts(context: Context, id: Long, yandex: Double?, road: Double?,
-                                        combined: Double?, yr: OfflineRoute?, br: OfflineRoute?) {
+                                        combined: Double?, yr: OfflineRoute?, br: OfflineRoute?,
+                                        usedMinutes: Double? = null, weight: Double? = null) {
         val rows = read(context)
         val row = rows.firstOrNull { it.id == id } ?: return
         // Never overwrite the confirmed fact. Full trip badge is kept distinct
@@ -112,7 +117,8 @@ edit("TrialStore.kt", "    @Synchronized fun observeMetered(context: Context, id
             combinedForecast = combined ?: row.combinedForecast,
             initialBadgeKm = row.initialBadgeKm ?: yr?.km,
             initialBadgeMinutes = row.initialBadgeMinutes ?: yr?.minutes,
-            combinedMinutes = if (combined != null && yr != null && br != null) DualFareMean.mean(yr.minutes, br.minutes) else row.combinedMinutes,
+            combinedMinutes = usedMinutes ?: row.combinedMinutes,
+            yandexTimeWeight = weight ?: row.yandexTimeWeight,
             routeKm = yr?.km ?: row.routeKm,
             routeMinutes = yr?.minutes ?: row.routeMinutes,
             offlineKm = br?.km ?: row.offlineKm,
@@ -129,7 +135,8 @@ edit("MainActivity.kt",
                     row.combinedForecast?.let { "Комбинированный " + FareEngine.kzt(it) },
                     row.initialBadgeMinutes?.let { "Яндекс %.1f мин".format(it) },
                     row.offlineMinutes?.takeIf { it > 0 }?.let { "BRouter %.1f мин".format(it) },
-                    row.combinedMinutes?.let { "Среднее время %.1f мин".format(it) },
+                    row.combinedMinutes?.let { "Адаптивное время %.1f мин".format(it) },
+                    row.yandexTimeWeight?.let { "Вес Яндекса %.0f%%".format(it * 100) },
                     row.combinedForecast?.let { avg -> row.actualGross?.takeIf { it > 0 }?.let {
                         "Ошибка комбинированного " + "%+.1f".format((avg-it)*100/it) + "%"
                     } }
@@ -142,9 +149,29 @@ internal object DualFareMean {
         require(a.isFinite() && b.isFinite() && a >= 0.0 && b >= 0.0)
         return a / 2.0 + b / 2.0
     }
-    fun combinedRoute(yandex: OfflineRoute, road: OfflineRoute): OfflineRoute {
+    fun fixedDemand(demand: Demand?): Double? {
+        if (demand == null || !demand.verified) return null
+        return when (demand.type) {
+            DemandType.FIXED_ADD -> demand.amount
+            DemandType.NONE -> 0.0
+            else -> null
+        }
+    }
+    // The surcharge is a demand signal, not a direct traffic measurement.
+    // Unknown or multiplier-only demand gets a neutral 70% Yandex weight.
+    fun yandexWeight(fixedSurcharge: Double?): Double = when {
+        fixedSurcharge == null || !fixedSurcharge.isFinite() || fixedSurcharge < 0 -> 0.7
+        fixedSurcharge >= 1500.0 -> 0.9
+        fixedSurcharge >= 1000.0 -> 0.8
+        fixedSurcharge >= 500.0 -> 0.6
+        else -> 0.5
+    }
+    fun combinedRoute(yandex: OfflineRoute, road: OfflineRoute, fixedSurcharge: Double? = null): OfflineRoute {
         require(!yandex.provisional && !road.provisional && yandex.km.isFinite() && yandex.km > 0.0)
-        return yandex.copy(minutes = mean(yandex.minutes, road.minutes), source = "Км Яндекса · среднее время")
+        require(yandex.minutes.isFinite() && yandex.minutes > 0 && road.minutes.isFinite() && road.minutes > 0)
+        val weight = yandexWeight(fixedSurcharge)
+        return yandex.copy(minutes = yandex.minutes * weight + road.minutes * (1.0 - weight),
+            source = "Адаптивный анализатор цены")
     }
 }
 ''')
@@ -152,10 +179,19 @@ p = Path("core-tests/AutoLearningCheck.kt")
 s = p.read_text()
 anchor = "fun main() {\n"
 assert s.count(anchor) == 1
-p.write_text(s.replace(anchor, anchor + '''    val hybrid = DualFareMean.combinedRoute(OfflineRoute(12.0, 80.0), OfflineRoute(15.0, 61.0))
+p.write_text(s.replace(anchor, anchor + '''    val hybrid = DualFareMean.combinedRoute(OfflineRoute(12.0, 80.0), OfflineRoute(15.0, 61.0), 0.0)
     check(hybrid.km == 12.0 && hybrid.minutes == 70.5)
-    check(DualFareMean.combinedRoute(OfflineRoute(3.0, 7.0), OfflineRoute(4.0, 5.0)).minutes == 6.0)
+    check(DualFareMean.combinedRoute(OfflineRoute(3.0, 7.0), OfflineRoute(4.0, 5.0), 499.0).minutes == 6.0)
+    check(DualFareMean.yandexWeight(0.0) == 0.5)
+    check(DualFareMean.yandexWeight(499.99) == 0.5)
+    check(DualFareMean.yandexWeight(500.0) == 0.6)
+    check(DualFareMean.yandexWeight(999.99) == 0.6)
+    check(DualFareMean.yandexWeight(1000.0) == 0.8)
+    check(DualFareMean.yandexWeight(1499.99) == 0.8)
+    check(DualFareMean.yandexWeight(1500.0) == 0.9)
+    check(DualFareMean.yandexWeight(null) == 0.7)
+    check(kotlin.math.abs(DualFareMean.combinedRoute(OfflineRoute(12.0, 30.0), OfflineRoute(14.0, 20.0), 1500.0).minutes - 29.0) < 1e-8)
     check(runCatching { DualFareMean.combinedRoute(OfflineRoute(3.0, 7.0), OfflineRoute(4.0, 5.0, provisional = true)) }.isFailure)
     check(runCatching { DualFareMean.mean(Double.NaN, 1.0) }.isFailure)
 '''))
-print("Hybrid fare experiment: Yandex distance, mean of Yandex and BRouter minutes, same reference tariff, local per-source comparison.")
+print("Adaptive fare experiment: Yandex distance, demand-weighted travel time, common reference tariff and local comparisons.")
