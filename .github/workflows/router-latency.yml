@@ -1,0 +1,108 @@
+name: BRouter v45 isolated latency benchmark
+on:
+  push:
+    branches: [test/v45-router-latency]
+    paths: ['.github/workflows/router-latency.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare exactly the v45 embedded core and map
+        run: bash patches/prepare_embedded_router.sh .
+      - name: Measure both profiles independently
+        shell: bash
+        run: |
+          cat > RouterLatency.java <<'JAVA'
+          import btools.router.*;
+          import java.io.File;
+          import java.util.*;
+          public class RouterLatency {
+            static final double[][] P = {
+              {43.2389,76.8897},{43.2449,76.9063},{43.2523,76.9345},
+              {43.2017,76.8704},{43.2246,76.8535},{43.3509,77.0222}
+            };
+            static final File DATA=new File("app/src/main/assets/brouter");
+            static RoutingContext context(boolean shortest) {
+              RoutingContext c=new RoutingContext();
+              c.localFunction=new File(DATA,shortest?"car-shortest-znay-v45.brf":"car-vario.brf").getAbsolutePath();
+              c.memoryclass=32;
+              return c;
+            }
+            static void warm(boolean shortest) {
+              RoutingContext c=context(shortest);
+              long start=System.nanoTime();
+              try { ProfileCache.parseProfile(c); } finally { ProfileCache.releaseProfile(c); }
+              System.out.printf(Locale.ROOT,"WARM,%s,%.3f%n",shortest,(System.nanoTime()-start)/1e6);
+            }
+            static class Stats {
+              ArrayList<Double> ms=new ArrayList<>();
+              int fail=0,over3=0,under1=0;
+              void add(double elapsed,boolean ok) {
+                if(ok) {ms.add(elapsed);if(elapsed<1000)under1++;if(elapsed>3000)over3++;}
+                else fail++;
+              }
+              double pct(double p) {
+                Collections.sort(ms);
+                return ms.isEmpty()?Double.NaN:ms.get(Math.max(0,(int)Math.ceil(p*ms.size())-1));
+              }
+              void report(String name) {
+                System.out.printf(Locale.ROOT,"SUMMARY,%s,success=%d,fail=%d,under1s=%d,over3s=%d,p50=%.3f,p95=%.3f,max=%.3f%n",
+                  name,ms.size(),fail,under1,over3,pct(.50),pct(.95),pct(1));
+              }
+            }
+            static double route(int i,int j,boolean shortest,Stats st,int rep) {
+              long begin=System.nanoTime();
+              try {
+                RoutingContext c=context(shortest);
+                RoutingEngine engine=new RoutingEngine(null,null,DATA,
+                  new RoutingParamCollector().readPositions(new double[]{P[i][1],P[j][1]},new double[]{P[i][0],P[j][0]}),
+                  c,RoutingEngine.BROUTER_ENGINEMODE_ROUTING);
+                engine.quite=true;
+                engine.doRun(shortest?3000:2000);
+                var t=engine.foundTrack;
+                boolean ok=t!=null && t.distance>=20 && t.totalSeconds>0 && t.nodes.size()>=2;
+                double elapsed=(System.nanoTime()-begin)/1e6;
+                st.add(elapsed,ok);
+                System.out.printf(Locale.ROOT,"CASE,%d,%d,%d,%s,%.3f,%s,%s,%s%n",
+                  rep,i,j,shortest,elapsed,ok,ok?t.distance:"-",ok?t.totalSeconds:"-");
+                return ok?t.distance:Double.NaN;
+              }catch(Exception e){
+                double elapsed=(System.nanoTime()-begin)/1e6;
+                st.add(elapsed,false);
+                System.out.printf(Locale.ROOT,"FAIL,%d,%d,%d,%s,%.3f,%s%n",rep,i,j,shortest,elapsed,e);
+                return Double.NaN;
+              }
+            }
+            public static void main(String[] args) {
+              warm(true);warm(false);
+              Stats n=new Stats(),o=new Stats();
+              int comparable=0,shorter=0,longer=0;
+              for(int rep=0;rep<3;rep++)for(int i=0;i<P.length;i++)for(int j=0;j<P.length;j++){
+                if(i==j)continue;
+                double a,b;
+                if((i+j+rep)%2==0){a=route(i,j,true,n,rep);b=route(i,j,false,o,rep);}
+                else{b=route(i,j,false,o,rep);a=route(i,j,true,n,rep);}
+                if(Double.isFinite(a)&&Double.isFinite(b)){comparable++;if(a<b)shorter++;if(a>b+50)longer++;}
+              }
+              n.report("v45-shortest");o.report("car-vario");
+              System.out.printf("COMPARE,pairs=%d,shorter=%d,longer_over_50m=%d%n",comparable,shorter,longer);
+              if(n.fail>0 || n.over3>0 || longer>0)System.out.println("REVIEW: inspect failures, deadline misses or distance regressions");
+            }
+          }
+          JAVA
+          javac -cp app/libs/brouter-1.7.10.jar RouterLatency.java
+          java -Xmx512m -cp .:app/libs/brouter-1.7.10.jar RouterLatency | tee router-latency.csv
+          grep '^SUMMARY\|^COMPARE\|^WARM' router-latency.csv >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: router-v45-latency
+          path: router-latency.csv
