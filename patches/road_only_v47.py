@@ -60,7 +60,7 @@ s = s[:a] + """        // Show a short explanation only while a usable fare is u
 """ + s[b:]
 # Width is specified in the window and also in the view's measurement.
 assert s.count("(240 * density).toInt()") == 1
-s = s.replace("(240 * density).toInt()", "(216 * density).toInt()")
+s = s.replace("(240 * density).toInt()", "(192 * density).toInt()")
 assert "if (logicalHeight != oldHeight) requestLayout()" in s
 assert s.index("hasQuote = estimate != null") < s.index("if (logicalHeight != oldHeight) requestLayout()")
 p.write_text(s)
@@ -68,6 +68,6 @@ p.write_text(s)
 p = root / "RadarAccessibilityService.kt"
 s = p.read_text()
 assert s.count("minOf(dp(240), screenWidth())") == 1
-s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(216), screenWidth())")
+s = s.replace("minOf(dp(240), screenWidth())", "minOf(dp(192), screenWidth())")
 p.write_text(s)
-print("Compact overlay: 216dp wide, 73.8dp fare height, 34.2dp waiting height; status only for missing fare.")
+print("Compact overlay: 192dp wide, 65.6dp fare height, 30.4dp waiting height; status only for missing fare.")
