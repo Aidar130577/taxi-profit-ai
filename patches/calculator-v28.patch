@@ -1,0 +1,167 @@
+--- a/app/src/main/java/kz/taxiprofitai/Engine.kt
++++ b/app/src/main/java/kz/taxiprofitai/Engine.kt
+@@ -153,6 +153,13 @@
+     private val routeAddress = Regex(
+         """(?iu)\b(?:улица|проспект|микрорайон|переулок|шоссе|бульвар|площадь|паркинг|plaza|mall|торговый центр|ТРЦ)\b|,\s*(?:вход|выход)\b|,\s*\d+\s*[А-ЯA-Z]?(?:\s*(?:к|корп(?:ус)?\.?|/)\s*\d+[А-ЯA-Z]?)?\s*$"""
+     )
++    private val placeName = Regex(
++        """(?iu)^(?:здание|кафе|кофейня|ресторан|магазин|гостиница|отель|клиника|больница|школа|университет|бизнес[ -]центр|жилой комплекс|ЖК|ТЦ|БЦ)\s+\p{L}.*"""
++    )
++    private val offerMetadata = Regex(
++        """(?iu)^(?:пассажир|принять|пропустить|оплата|наличные|картой|подача|ближняя подача|дальняя подача|без надбавки|ожидание|комментарий|приоритет|спрос)\b"""
++    )
++
+     private val neutralBoost = Regex("""(?iu)(?<![\p{L}\d])[×xх]\s*1[.,]0{1,2}(?![\d.,])""")
+     private val excludedOrder = Regex("(?iu)(?<![\\p{L}])(доставка|курьер|грузовой|яндекс\\s+еда|межгород|вместе)(?![\\p{L}])")
+     private val displayedFare = Regex(
+@@ -204,10 +211,23 @@
+         val end = if (passengerIndex > pickupIndex) passengerIndex else acceptIndex
+         val body = if (pickupIndex >= 0 && end > pickupIndex) addresses.subList(pickupIndex + 1, end) else emptyList()
+         val candidates = body.map { routeMarker.matchEntire(it)?.groupValues?.get(3) ?: it }
+-            .map(String::trim).filter { it.length >= 7 && routeAddress.containsMatchIn(it) }.distinct()
++            .map(String::trim).filter { it.length >= 7 && (routeAddress.containsMatchIn(it) || placeName.matches(it)) }.distinct()
+         val fallback = candidates.takeIf { it.size == 2 && isOrder }
+-        val a = extract("А", "A") ?: fallback?.get(0)
+-        val b = extract("Б", "B") ?: fallback?.get(1)
++        val firstRouteLine = body.firstOrNull { line ->
++            !offerMetadata.containsMatchIn(line) && TarifCatalog.titles.none { it.equals(line, true) }
++        }
++        val a = extract("А", "A") ?: fallback?.get(0) ?: candidates.singleOrNull()?.takeIf { it == firstRouteLine }
++        val afterPickup = body.indexOfFirst { line ->
++            line == a || routeMarker.matchEntire(line)?.groupValues?.get(3) == a
++        }
++        val unmarkedDestination = if (isOrder && afterPickup >= 0 && passengerIndex > pickupIndex) {
++            body.drop(afterPickup + 1).filter { line ->
++                line.length in 3..120 && line.first().isLetter() &&
++                    !offerMetadata.containsMatchIn(line) && TarifCatalog.titles.none { it.equals(line, true) } &&
++                    routeMarker.matchEntire(line) == null
++            }.distinct().singleOrNull()
++        } else null
++        val b = extract("Б", "B") ?: fallback?.get(1) ?: unmarkedDestination
+         // A multiplier of exactly one on the accept control is a confirmed absence of extra demand.
+         val noIncrease = acceptIndex >= 0 && addresses.drop(acceptIndex).take(2).any(neutralBoost::containsMatchIn)
+         val demand = if (isOrder) OfferDemandEvidence.direct(t) ?: OfferDemandEvidence.acceptButton(t)
+--- a/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfferPopupView.kt
+@@ -79,7 +79,7 @@
+             status.startsWith("Надбавка неизвестна") -> "База · надбавка неизвестна"
+             status.startsWith("Надбавка") -> "Не считана надбавка"
+             status.startsWith("Адреса") -> "Не считаны адреса"
+-            status.startsWith("Адрес не найден") -> status
++            status.startsWith("Адрес не найден") || status == "Уточните название места" -> status
+             status.startsWith("Нет маршрута") -> "Нет маршрута BRouter"
+             status.startsWith("Маршрут") -> "Считаем…"
+             status == "Учтён опыт поездок" -> status
+--- a/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
++++ b/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt
+@@ -53,15 +53,22 @@
+         else {
+             @Suppress("DEPRECATION")
+             val geocoder=Geocoder(appContext,Locale("ru","KZ"))
+-            val cleaned = raw.replace(Regex("""(?iu),\s*(?:выход|вход)\b.*$"""), "").trim()
+-            val expanded = cleaned.replace(Regex("""(?iu)(\d+[а-я]?)[кk](\d+[а-я]?)$"""), "$1 корпус $2")
+-            val queries = listOf(raw, expanded, cleaned).filter { it.isNotBlank() }.distinct()
+-            val list=queries.asSequence().map{q->
+-                runCatching{geocoder.getFromLocationName("$q, Алматы, Казахстан",5)}.getOrNull()
+-            }.firstOrNull{items->items?.any{it.latitude in 42.5..44.5 && it.longitude in 75.0..79.0}==true}
+-            val valid=list?.firstOrNull { it.latitude in 42.5..44.5 && it.longitude in 75.0..79.0 }
+-                ?: error("Не удалось найти адрес: $raw. Проверь адрес или введи координаты.")
+-            BRouterConnector.Point(valid.latitude,valid.longitude)
++            val queries = PlaceLookup.queries(raw)
++            val named = PlaceLookup.isNamedPlace(queries.lastOrNull().orEmpty())
++            val found = queries.asSequence().map { query ->
++                @Suppress("DEPRECATION")
++                runCatching { geocoder.getFromLocationName("$query, Алматы, Казахстан", 5) }.getOrNull()
++                    .orEmpty().mapNotNull { address ->
++                        if (!address.hasLatitude() || !address.hasLongitude() ||
++                            address.latitude !in 42.5..44.5 || address.longitude !in 75.0..79.0) return@mapNotNull null
++                        PlaceLookup.Match(address.latitude, address.longitude,
++                            listOfNotNull(address.featureName, address.premises, address.getAddressLine(0)))
++                    }
++            }.map { matches ->
++                if (named) PlaceLookup.namedMatch(queries.last(), matches) else matches.firstOrNull()
++            }.firstOrNull { it != null }
++                ?: error(if (named) "Место не найдено однозначно" else "Не удалось найти адрес: $raw")
++            BRouterConnector.Point(found.lat, found.lon)
+         }
+         synchronized(pointCache) { pointCache[norm]=found }
+         return found
+--- /dev/null
++++ b/app/src/main/java/kz/taxiprofitai/PlaceLookup.kt
+@@ -0,0 +1,38 @@
++package kz.taxiprofitai
++
++/** Helpers for looking up the named place printed on a passenger offer. */
++object PlaceLookup {
++    data class Match(val lat: Double, val lon: Double, val labels: List<String>)
++
++    private val entrance = Regex("""(?iu)(?:,|\s+[—–-])\s*(?:выход|вход)\b.*$""")
++    private val street = Regex("""(?iu)\b(?:улица|проспект|микрорайон|шоссе|переулок|бульвар|просп)\b|,\s*\d+\s*[А-ЯA-Z]?(?:\s*к(?:орпус)?\s*\d+)?\s*$""")
++    private val prefix = Regex("""(?iu)^(?:кафе|кофейня|ресторан|ТРЦ|ТЦ|БЦ|ЖК|здание|магазин|отель|гостиница)\s+""")
++    private val words = Regex("""[^\p{L}\p{N}]+""")
++
++    fun queries(raw: String): List<String> {
++        val name = raw.replace(entrance, "").trim()
++        val expanded = name.replace(Regex("""(?iu)(\d+[а-я]?)[кk](\d+[а-я]?)$"""), "$1 корпус $2")
++        return listOf(raw, expanded, name).filter(String::isNotBlank).distinct()
++    }
++
++    fun isNamedPlace(text: String): Boolean = text.isNotBlank() && !street.containsMatchIn(text)
++
++    fun namedMatch(name: String, matches: List<Match>): Match? {
++        val key = normalize(name)
++        if (key.length < 3 || key.none(Char::isLetter)) return null
++        // Accept the named object itself. A neighbourhood, a street, or a city-level match cannot substitute for it.
++        val candidates = matches.filter { item ->
++            item.labels.any { label ->
++                label.split(',').any { normalize(it) == key }
++            }
++        }
++        val first = candidates.firstOrNull() ?: return null
++        // Multiple geocoder records for one building are tolerable; separated branches are ambiguous.
++        return first.takeIf { candidates.all { match ->
++            kotlin.math.abs(match.lat - first.lat) <= 0.0008 && kotlin.math.abs(match.lon - first.lon) <= 0.001
++        } }
++    }
++
++    private fun normalize(text: String): String =
++        text.trim().replace(prefix, "").lowercase().replace('ё', 'е').replace(words, " ").trim()
++}
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -352,8 +352,11 @@
+                                 else -> "Офлайн BRouter • без живых пробок"
+                             }
+                         }, onFailure = {
+-                            routeStatus = if (result.exceptionOrNull()?.message?.startsWith("Не удалось найти адрес") == true)
+-                                "Адрес не найден на карте" else "Нет маршрута BRouter"
++                            routeStatus = when {
++                                result.exceptionOrNull()?.message == "Место не найдено однозначно" -> "Уточните название места"
++                                result.exceptionOrNull()?.message?.startsWith("Не удалось найти адрес") == true -> "Адрес не найден на карте"
++                                else -> "Нет маршрута BRouter"
++                            }
+                         })
+                         render()
+                     }
+--- a/core-tests/LocalFareLearningCheck.kt
++++ b/core-tests/LocalFareLearningCheck.kt
+@@ -59,5 +59,18 @@
+     check(OrderTextParser.parse(orderCard.replace("х1.00", "х1.50")).demand == null)
+     val estimate = RouteFareEstimator.calculate(TarifCatalog.forName(card.tariff)!!, OfflineRoute(3.0, 7.0, "test"), card.demand!!, 19.2, 1.0)
+     check(estimate.gross == 917.0 && abs(estimate.net!! - 731.766) < 0.00001)
+-    println("32 calculator, EV and incoming card checks passed")
++    val cafe = "600 м · 3 мин\nБлижняя подача\nКомфорт+\nпроспект Тестовый, 28Ак14\nКафе Ласточка\nПассажир\nПринять"
++    check(OrderTextParser.parse(cafe).destination == "Кафе Ласточка")
++    check(OrderTextParser.parse(cafe.replace("Кафе Ласточка", "Ласточка")).destination == "Ласточка")
++    check(OrderTextParser.parse(cafe.replace("Кафе Ласточка", "(Б) Жемчужина")).destination == "Жемчужина")
++    check(OrderTextParser.parse(cafe.replace("Кафе Ласточка", "Оплата картой")).destination == null)
++    check(OrderTextParser.parse(cafe.replace("Кафе Ласточка", "Ласточка\nАльбатрос")).destination == null)
++    check(PlaceLookup.queries("Галерея, Выход А — Тестовая") == listOf("Галерея, Выход А — Тестовая", "Галерея"))
++    check(!PlaceLookup.isNamedPlace("проспект Тестовый, 28Ак14") && PlaceLookup.isNamedPlace("Кафе Ласточка"))
++    val branch = PlaceLookup.Match(43.25, 76.94, listOf("Ласточка", "улица Тестовая"))
++    val city = PlaceLookup.Match(43.25, 76.95, listOf("Алматы"))
++    check(PlaceLookup.namedMatch("Кафе «Ласточка»", listOf(city, branch)) == branch)
++    check(PlaceLookup.namedMatch("Ласточка", listOf(branch, branch.copy(lat = 43.28))) == null)
++    check(PlaceLookup.namedMatch("Ласточка", listOf(city)) == null)
++    println("42 calculator, incoming card and named place checks passed")
+ }
