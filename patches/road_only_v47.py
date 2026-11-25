@@ -75,20 +75,24 @@ s = s[:a] + """        line(c,29f)
         // Fit both amounts to the same full column width, with 3 logical
         // pixels of clearance on each side. Keep the same font height.
         fun amount(value: String, center: Float, color: Int) {
-            val clean = value.replace("≈", "").trim()
+            val clean = value.filterNot { it == '≈' || it == '₸' || it.isWhitespace() || Character.isSpaceChar(it) }
             if (clean.isEmpty()) return
             compactAmountPaint.color = color
             compactAmountPaint.textScaleX = 1f
             val measured = compactAmountPaint.measureText(clean)
             if (measured > 0f && measured.isFinite()) {
                 compactAmountPaint.textScaleX = 114f / measured
-                c.drawText(clean, center, 82f, compactAmountPaint)
+                c.drawText(clean, center, 86f, compactAmountPaint)
             }
             compactAmountPaint.textScaleX = 1f
         }
         amount(gross.removePrefix("СТОИМОСТЬ "),60f,yellow)
         amount(net.removePrefix("НА РУКИ "),180f,green)
 """ + s[b:]
+# Currency unit is implicit throughout the overlay, including surcharge.
+assert s.count("        demandText=demand\n") == 1
+s = s.replace("        demandText=demand\n", """        demandText = demand.filterNot { it == '₸' || it.isWhitespace() || Character.isSpaceChar(it) }
+""")
 # Dedicated paint prevents horizontal fitting from affecting other text.
 anchor = "    override fun onDraw(c:Canvas){"
 assert s.count(anchor) == 1
@@ -96,7 +100,7 @@ s = s.replace(anchor, """    private val compactAmountPaint = Paint(Paint.ANTI_A
         style = Paint.Style.FILL
         typeface = android.graphics.Typeface.DEFAULT_BOLD
         textAlign = Paint.Align.CENTER
-        textSize = 22f
+        textSize = 32f
     }
 
 """ + anchor)
