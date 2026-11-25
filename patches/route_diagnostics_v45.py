@@ -14,7 +14,7 @@ edit("BRouterRouteResult.kt", '    val provisional: Boolean = false)', '''    va
     val requestedB: RoutePoint? = null)
 data class RoutePoint(val lat: Double, val lon: Double)''')
 edit("EmbeddedRoadRouter.kt", '        return OfflineRoute(result.distance / 1000.0, result.totalSeconds / 60.0)', '''        val points = result.nodes.map { node ->
-            RoutePoint(node.iLat / 1_000_000.0 - 90.0, node.iLon / 1_000_000.0 - 180.0)
+            RoutePoint(node.getILat() / 1_000_000.0 - 90.0, node.getILon() / 1_000_000.0 - 180.0)
         }
         return OfflineRoute(result.distance / 1000.0, result.totalSeconds / 60.0,
             geometry = points, requestedA = RoutePoint(fromLat, fromLon), requestedB = RoutePoint(toLat, toLon))''')
