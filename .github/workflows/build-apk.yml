@@ -122,6 +122,7 @@ jobs:
           patch --batch -p1 < ../patches/calculator-v42.patch
           python3 ../patches/stability_v43.py
           python3 ../patches/road_packs_v43.py
+          python3 ../patches/traffic_pilot_v43.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
