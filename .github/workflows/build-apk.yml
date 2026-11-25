@@ -104,6 +104,7 @@ jobs:
           patch --batch -p1 < ../patches/calculator-v27.patch
           patch --batch -p1 < ../patches/calculator-v28.patch
           patch --batch -p1 < ../patches/calculator-v29.patch
+          patch --batch -p1 < ../patches/calculator-v30.patch
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -125,7 +126,7 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 29').replace('0.17.0-approved-overlays', '0.29.0-offline-almaty'))
+          g.write_text(s.replace('versionCode = 17', 'versionCode = 30').replace('0.17.0-approved-overlays', '0.30.0-accessibility-connection'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -166,12 +167,30 @@ jobs:
       - name: Assemble test APK
         working-directory: android-project
         run: gradle --no-daemon --stacktrace :app:assembleDebug
+      - name: Check emulator support
+        id: emulator
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::This runner has no KVM; Android 14 connection test is skipped."
+          fi
+      - name: Verify accessibility service on Android 14
+        if: steps.emulator.outputs.available == 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash patches/test_accessibility_connection.sh
       - name: Verify packaged launcher icon
         shell: bash
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='29'" apk-badging.txt
+          grep -q "versionCode='30'" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
@@ -179,10 +198,10 @@ jobs:
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
-          cp "$APK" ZnayTsenu-v29.apk
+          cp "$APK" ZnayTsenu-v30.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v29-branded-apk
-          path: ZnayTsenu-v29.apk
+          name: ZnayTsenu-v30-branded-apk
+          path: ZnayTsenu-v30.apk
           retention-days: 7
           if-no-files-found: error

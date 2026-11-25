@@ -1,0 +1,324 @@
+--- a/app/src/main/java/kz/taxiprofitai/MainActivity.kt
++++ b/app/src/main/java/kz/taxiprofitai/MainActivity.kt
+@@ -2,6 +2,9 @@
+ 
+ import android.app.Activity
+ import android.content.Intent
++import android.content.ComponentName
++import android.os.Handler
++import android.os.Looper
+ import android.graphics.Color
+ import android.graphics.Typeface
+ import android.graphics.drawable.GradientDrawable
+@@ -21,6 +24,13 @@
+     private lateinit var loyalty: Spinner
+     private lateinit var status: TextView
+     private lateinit var permissionState: TextView
++    private val statusHandler = Handler(Looper.getMainLooper())
++    private val refreshServiceStatus = object : Runnable {
++        override fun run() {
++            updatePermission()
++            statusHandler.postDelayed(this, 750L)
++        }
++    }
+     private lateinit var stop: Button
+     private val gold=Color.rgb(255,225,0)
+     private val dark=Color.rgb(16,28,33)
+@@ -48,13 +58,28 @@
+     }
+     private fun updatePermission(){
+         if(!::permissionState.isInitialized)return
+-        val enabled=accessibilityEnabled()
+-        permissionState.text=if(enabled)"Включено" else "Не включено"
+-        permissionState.setTextColor(if(enabled)Color.rgb(162,255,151) else gold)
+-        stop.visibility = if (prefs.getBoolean("shift_active",false)) View.VISIBLE else View.GONE
+-
+-    }
+-    override fun onResume(){super.onResume();updatePermission()}
++        val connected = RadarAccessibilityService.connected
++        val label = when {
++            connected -> "Включено"
++            accessibilityAllowed() -> "Служба не подключилась"
++            else -> "Не включено"
++        }
++        if (permissionState.text != label) {
++            permissionState.text = label
++            permissionState.setTextColor(if (connected) Color.rgb(162,255,151) else gold)
++        }
++        stop.visibility = if (prefs.getBoolean("shift_active", false)) View.VISIBLE else View.GONE
++    }
++
++    override fun onResume() {
++        super.onResume()
++        statusHandler.post(refreshServiceStatus)
++    }
++
++    override fun onPause() {
++        statusHandler.removeCallbacks(refreshServiceStatus)
++        super.onPause()
++    }
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -78,7 +103,7 @@
+         permissionState=label("Проверка…",13f,gold)
+         permText.addView(permissionState)
+         permission.addView(permText,LinearLayout.LayoutParams(0,ViewGroup.LayoutParams.WRAP_CONTENT,1f))
+-        permission.addView(action("Открыть"){openPermissions()})
++        permission.addView(action("Открыть"){ openServiceSettings() })
+         root.addView(permission)
+         space(root,10)
+         val parkRow=LinearLayout(this).apply {orientation=LinearLayout.HORIZONTAL;gravity=Gravity.CENTER_VERTICAL}
+@@ -93,10 +118,7 @@
+         space(root,6)
+         root.addView(action("Включить калькулятор",true){
+             if(save()){
+-                if(!accessibilityEnabled())openPermissions()
+-                else {
+-                    startCalculator()
+-                }
++                if (RadarAccessibilityService.connected) startCalculator() else openServiceSettings()
+             }
+         },LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,dp(48)))
+         stop=action("Выключить калькулятор"){
+@@ -151,20 +173,29 @@
+                 startActivity(Intent(Intent.ACTION_VIEW,android.net.Uri.parse("https://f-droid.org/packages/btools.routingapp/")))
+             }.show()
+     }
+-    private fun openPermissions(){
++    private fun openServiceSettings() {
++        val allowed = accessibilityAllowed()
++        val connected = RadarAccessibilityService.connected
++        val diagnostic = prefs.getString(RadarAccessibilityService.DIAGNOSTIC, null)
++        val message = when {
++            connected -> "Служба уже подключена. Вернитесь в приложение и включите калькулятор."
++            allowed -> "Переключатель включён, но Android ещё не подключил службу. В «Скачанных приложениях» выключите «Знай цену» и включите снова."
++            else -> "Откройте «Скачанные приложения» → «Знай цену — чтение карточки заказа» и включите основной переключатель. Затем вернитесь и включите калькулятор."
++        }
+         android.app.AlertDialog.Builder(this)
+-            .setTitle("Разрешение Android")
+-            .setMessage("Откройте «Основные» → «Скачанные приложения» → «Знай цену». Включите службу, затем вернитесь сюда и включите калькулятор. Служба читает доступный текст карточки заказа в Яндекс Про и показывает расчёт. Разрешение можно отключить в любой момент.")
+-            .setNegativeButton("Отмена",null)
+-            .setPositiveButton("Открыть настройки"){_,_->startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))}
++            .setTitle(if (allowed && !connected) "Служба не подключилась" else "Чтение карточки заказа")
++            .setMessage(if (diagnostic != null) "$message\n\n$diagnostic" else message)
++            .setNegativeButton("Закрыть", null)
++            .setPositiveButton("Открыть настройки"){ _, _ ->
++                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
++            }
+             .show()
+     }
+-    private fun accessibilityEnabled():Boolean {
+-        val am=getSystemService(ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager
+-        return am.getEnabledAccessibilityServiceList(android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK).any {
+-            val info=it.resolveInfo.serviceInfo
+-            info.packageName==packageName && info.name==RadarAccessibilityService::class.java.name
+-        }
++
++    private fun accessibilityAllowed(): Boolean {
++        val service = ComponentName(this, RadarAccessibilityService::class.java)
++        return Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
++            .orEmpty().split(':').any { ComponentName.unflattenFromString(it) == service }
+     }
+     private fun save(): Boolean {
+         val p=park.text.toString().trim().replace(',','.').toDoubleOrNull()
+--- a/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
++++ b/app/src/main/java/kz/taxiprofitai/RadarAccessibilityService.kt
+@@ -1,6 +1,8 @@
+ package kz.taxiprofitai
+ 
+ import android.accessibilityservice.AccessibilityService
++import android.content.Intent
++import android.util.Log
+ import android.graphics.PixelFormat
+ import android.os.Handler
+ import android.os.Looper
+@@ -15,9 +17,16 @@
+ 
+ /** User-enabled, read-only overlay. Does NOT click or alter Yandex Pro, use hidden APIs, or capture other apps. Optional local window OCR only with user consent. */
+ class RadarAccessibilityService: AccessibilityService() {
++    companion object {
++        @Volatile var connected = false
++            private set
++        const val DIAGNOSTIC = "accessibility_connection_diagnostic"
++    }
++    private var overlayAttempts = 0
++
+     private val ui=Handler(Looper.getMainLooper())
+     private val prefs by lazy { getSharedPreferences("taxi_profit_settings",MODE_PRIVATE) }
+-    private lateinit var routePipeline: OfflineRoutePipeline
++    private var routePipeline: OfflineRoutePipeline? = null
+     private var routeKey: String? = null
+     private var estimate: LiveFareEstimate? = null
+     private var routeStatus: String = ""
+@@ -44,7 +53,7 @@
+     private var scanScheduled = false
+     private val scan = Runnable {
+         scanScheduled = false
+-        scanActiveWindow()
++        scanSafely()
+     }
+     private fun scheduleScan(delay: Long) {
+         if (scanScheduled) return
+@@ -68,22 +77,44 @@
+     }
+     override fun onServiceConnected() {
+         super.onServiceConnected()
+-        windows=getSystemService(WINDOW_SERVICE) as WindowManager
+-        prefs.registerOnSharedPreferenceChangeListener(settingsListener)
+-        if(prefs.getBoolean("shift_active",false))startShift()
++        connected = false
++        try {
++            windows = getSystemService(WindowManager::class.java)
++                ?: error("WindowManager unavailable")
++            prefs.registerOnSharedPreferenceChangeListener(settingsListener)
++            prefs.edit().remove(DIAGNOSTIC).apply()
++            connected = true
++            if (prefs.getBoolean("shift_active", false)) startShift()
++        } catch (e: Exception) {
++            recordFailure("Подключение службы", e)
++        }
++    }
++
++    private fun recordFailure(stage: String, error: Exception) {
++        val detail = "$stage · ${error.javaClass.simpleName}"
++        Log.w("ZnayTsenuService", detail)
++        prefs.edit().putString(DIAGNOSTIC, detail).apply()
++    }
++
++    private fun scanSafely(retryIfMissing: Boolean = false) {
++        try {
++            scanActiveWindow(retryIfMissing)
++        } catch (e: Exception) {
++            recordFailure("Чтение окна", e)
++        }
+     }
+     private fun screenWidth()=resources.displayMetrics.widthPixels
+     private fun screenHeight()=resources.displayMetrics.heightPixels
+     private fun startShift() {
+-        if (running || !::windows.isInitialized) return
++        if (running || !connected) return
+         running = true
+-        ocr = WindowOcr(this)
++        overlayAttempts = 0
+         ocrEpoch++
+         lastOcr = 0
+         ocrBusy = false
+-        routePipeline = OfflineRoutePipeline(this)
+         lastScan = 0
+-        scanActiveWindow(retryIfMissing = true)
++        // Wait for the system to finish binding the service and assigning its overlay token.
++        scheduleScan(200L)
+     }
+ 
+     private fun stopShift() {
+@@ -97,7 +128,8 @@
+         ocrBusy = false
+         closeOffer()
+         hideFarePopup()
+-        if (::routePipeline.isInitialized) routePipeline.close()
++        routePipeline?.close()
++        routePipeline = null
+     }
+ 
+     private fun showFarePopup() {
+@@ -138,7 +170,13 @@
+                     if (moving) {
+                         layout.x = (initialX + (event.rawX - touchX).toInt()).coerceIn(0, maxX)
+                         layout.y = (initialY + (event.rawY - touchY).toInt()).coerceIn(0, maxY)
+-                        windows.updateViewLayout(panel, layout)
++                        if (popup === panel && panel.isAttachedToWindow) {
++                            try {
++                                windows.updateViewLayout(panel, layout)
++                            } catch (e: IllegalArgumentException) {
++                                recordFailure("Перемещение плашки", e)
++                            }
++                        }
+                     }
+                     true
+                 }
+@@ -151,13 +189,30 @@
+                 else -> false
+             }
+         }
+-        popup = panel
+-        windows.addView(panel, layout)
++        try {
++            windows.addView(panel, layout)
++            popup = panel
++            overlayAttempts = 0
++            prefs.edit().remove(DIAGNOSTIC).apply()
++        } catch (e: WindowManager.BadTokenException) {
++            recordFailure("Показ плашки", e)
++            if (++overlayAttempts <= 2) scheduleScan(400L)
++        } catch (e: WindowManager.InvalidDisplayException) {
++            recordFailure("Показ плашки", e)
++        } catch (e: SecurityException) {
++            recordFailure("Показ плашки", e)
++        }
+     }
+ 
+     private fun hideFarePopup() {
+-        popup?.let { windows.removeView(it) }
++        val panel = popup
+         popup = null
++        if (panel?.isAttachedToWindow != true) return
++        try {
++            windows.removeView(panel)
++        } catch (e: IllegalArgumentException) {
++            recordFailure("Закрытие плашки", e)
++        }
+     }
+ 
+     private fun closeOffer() {
+@@ -178,7 +233,8 @@
+         windowChangedSinceScan = windowChangedSinceScan || windowChanged
+         if (windowChanged) {
+             cancelScan()
+-            scanActiveWindow(retryIfMissing = true)
++            overlayAttempts = 0
++            scanSafely(retryIfMissing = true)
+         } else {
+             val elapsed = android.os.SystemClock.elapsedRealtime() - lastScan
+             scheduleScan((450L - elapsed).coerceAtLeast(0L))
+@@ -232,7 +288,7 @@
+     private fun tryOcr(windowId:Int,generation:Long,now:Long,visible:String){
+         if(android.os.Build.VERSION.SDK_INT<34 || !prefs.getBoolean("ocr_allowed",false))return
+         if(ocrBusy || now-lastOcr<1800L)return
+-        val worker=ocr ?: return
++        val worker = ocr ?: WindowOcr(this).also { ocr = it }
+         ocrBusy=true;lastOcr=now
+         val epoch=ocrEpoch
+         try{
+@@ -312,7 +368,8 @@
+                 } else {
+                     routeStatus = "Маршрут рассчитывается..."
+                     val calcStartedAt = android.os.SystemClock.elapsedRealtime()
+-                    routePipeline.calculate(newer.pickup, newer.destination) { result ->
++                    val pipeline = routePipeline ?: OfflineRoutePipeline(this).also { routePipeline = it }
++                    pipeline.calculate(newer.pickup, newer.destination) { result ->
+                         if (!running || routeGeneration != generation) return@calculate
+                         result.fold(onSuccess = { route ->
+                             val observedDemand = newer.demand
+@@ -390,9 +447,19 @@
+         } else panel.showWaiting()
+     }
+     override fun onInterrupt(){}
++    private fun disconnect() {
++        connected = false
++        prefs.unregisterOnSharedPreferenceChangeListener(settingsListener)
++        if (running) stopShift()
++    }
++
++    override fun onUnbind(intent: Intent?): Boolean {
++        disconnect()
++        return super.onUnbind(intent)
++    }
++
+     override fun onDestroy() {
+-        prefs.unregisterOnSharedPreferenceChangeListener(settingsListener)
+-        stopShift()
++        disconnect()
+         super.onDestroy()
+     }
+ }
