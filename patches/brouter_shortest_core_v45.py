@@ -50,4 +50,17 @@ s=s.replace("assign pass1coefficient    = 1.3",
 # Disable turn-by-turn hints, speed-profile and display-only outputs.
 assert s.count("assign turnInstructionMode          = 1")==1
 s=s.replace("assign turnInstructionMode          = 1","assign turnInstructionMode          = 0")
+# Prefer through streets to service/living-street shortcuts; keep legal local access.
+# Multipliers are search costs, NOT artificial increases in physical distance or ETA.
+# A finite penalty permits the unavoidable first/last local access.
+old = "  add no_river_penalty\n  0\n"
+new = """  add no_river_penalty
+  switch highway=service|living_street 8
+  switch highway=residential 1.8
+  switch highway=track|road|path 12
+  switch highway=unclassified 1.15
+  1
+"""
+assert s.count(old)==1
+s=s.replace(old,new,1)
 profile.with_name("car-shortest-znay-v45.brf").write_text(s)
