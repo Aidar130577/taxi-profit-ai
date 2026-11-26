@@ -1,8 +1,10 @@
 name: Build Taxi Profit AI Android APK
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main, fix/v43-stability, fix/v44-hyperos-recovery, fix/v45-route-diagnostics]
   push:
-    branches: [main]
+    branches: [main, fix/v43-stability, fix/v44-hyperos-recovery, fix/v45-route-diagnostics, test/v46-road-apk, fix/v47-road-only]
     paths:
       - 'Taxi_Profit_AI_v0.17_source.zip'
       - '.github/workflows/build-apk.yml'
@@ -118,6 +120,18 @@ jobs:
           patch --batch -p1 < ../patches/calculator-v40.patch
           patch --batch -p1 < ../patches/calculator-v41.patch
           patch --batch -p1 < ../patches/calculator-v42.patch
+          python3 ../patches/stability_v43.py
+          python3 ../patches/road_packs_v43.py
+          python3 ../patches/traffic_pilot_v43.py
+          python3 ../patches/hyperos_recovery_v44.py
+          python3 ../patches/unified_learning_v44.py
+          python3 ../patches/route_diagnostics_v45.py
+          python3 ../patches/shortest_route_v45.py
+          python3 ../patches/road_only_v47.py
+          python3 ../patches/dual_fare_v47.py
+          python3 ../patches/passenger_warning_v48.py
+          python3 ../patches/eta_training_export_v48.py
+          python3 ../patches/tomtom_pilot_v49.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -139,7 +153,10 @@ jobs:
           g = Path("android-project/app/build.gradle.kts")
           s = g.read_text()
           assert 'versionCode = 17' in s
-          g.write_text(s.replace('versionCode = 17', 'versionCode = 42').replace('0.17.0-approved-overlays', '0.42.0-embedded-router'))
+          assert 'minSdk = 26' in s
+          assert 'applicationId = "kz.taxiprofitai"' in s
+          s = s.replace('applicationId = "kz.taxiprofitai"', 'applicationId = "kz.taxiprofitai.roadonly"')
+          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 49').replace('0.17.0-approved-overlays', '0.49.0-tomtom-pilot'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -166,7 +183,7 @@ jobs:
         working-directory: android-project
         run: |
           command -v kotlinc
-          kotlinc app/src/main/java/kz/taxiprofitai/Engine.kt app/src/main/java/kz/taxiprofitai/CommissionCatalog.kt app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/OfferPopupState.kt core-tests/OfferDemandCheck.kt core-tests/OfferPopupCheck.kt app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt app/src/main/java/kz/taxiprofitai/NetQuotePresentation.kt app/src/main/java/kz/taxiprofitai/PlaceLookup.kt app/src/main/java/kz/taxiprofitai/AlmatyLookupKey.kt core-tests/LocalFareLearningCheck.kt app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt core-tests/RideTimeCheck.kt app/src/main/java/kz/taxiprofitai/TripBadge.kt core-tests/TripBadgeCheck.kt app/src/main/java/kz/taxiprofitai/TripProgress.kt core-tests/TripProgressCheck.kt app/src/main/java/kz/taxiprofitai/TripReceipt.kt app/src/main/java/kz/taxiprofitai/LearnedRates.kt core-tests/AutoLearningCheck.kt -include-runtime -d /tmp/offer-demand.jar
+          kotlinc app/src/main/java/kz/taxiprofitai/Engine.kt app/src/main/java/kz/taxiprofitai/CommissionCatalog.kt app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/OfferPopupState.kt core-tests/OfferDemandCheck.kt core-tests/OfferPopupCheck.kt app/src/main/java/kz/taxiprofitai/LocalFareLearning.kt app/src/main/java/kz/taxiprofitai/NetQuotePresentation.kt app/src/main/java/kz/taxiprofitai/PlaceLookup.kt app/src/main/java/kz/taxiprofitai/AlmatyLookupKey.kt core-tests/LocalFareLearningCheck.kt app/src/main/java/kz/taxiprofitai/RideTimeLearning.kt core-tests/RideTimeCheck.kt app/src/main/java/kz/taxiprofitai/TripBadge.kt core-tests/TripBadgeCheck.kt app/src/main/java/kz/taxiprofitai/TripProgress.kt core-tests/TripProgressCheck.kt app/src/main/java/kz/taxiprofitai/TripReceipt.kt app/src/main/java/kz/taxiprofitai/LearnedRates.kt app/src/main/java/kz/taxiprofitai/DualFareMean.kt core-tests/AutoLearningCheck.kt -include-runtime -d /tmp/offer-demand.jar
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.OfferDemandCheckKt
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.OfferPopupCheckKt
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.LocalFareLearningCheckKt
@@ -174,6 +191,8 @@ jobs:
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.TripBadgeCheckKt
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.TripProgressCheckKt
           java -cp /tmp/offer-demand.jar kz.taxiprofitai.AutoLearningCheckKt
+          kotlinc app/src/main/java/kz/taxiprofitai/TomTomMetrics.kt core-tests/TomTomMetricsCheck.kt -include-runtime -d /tmp/tomtom-metrics.jar
+          java -jar /tmp/tomtom-metrics.jar
       - name: Build offline Almaty address index
         run: |
           python3 -m pip install --target "$RUNNER_TEMP/osm-python" 'osmium==4.3.2'
@@ -186,7 +205,7 @@ jobs:
           bash patches/prepare_embedded_router.sh android-project
           cd android-project
           EMBEDDED=app/libs/brouter-1.7.10.jar
-          kotlinc -classpath "$EMBEDDED" app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/EmbeddedRoadRouter.kt core-tests/EmbeddedRouterCheck.kt -include-runtime -d /tmp/embedded-router.jar
+          kotlinc -classpath "$EMBEDDED" app/src/main/java/kz/taxiprofitai/BRouterRouteResult.kt app/src/main/java/kz/taxiprofitai/EmbeddedRoadRouter.kt app/src/main/java/kz/taxiprofitai/KazakhstanRoadTiles.kt core-tests/EmbeddedRouterCheck.kt -include-runtime -d /tmp/embedded-router.jar
           java -cp "/tmp/embedded-router.jar:$EMBEDDED" kz.taxiprofitai.EmbeddedRouterCheckKt app/src/main/assets/brouter
       - name: Assemble test APK
         working-directory: android-project
@@ -196,20 +215,27 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='42'" apk-badging.txt
+          grep -q "versionCode='49'" apk-badging.txt
+          grep -q "package: name='kz.taxiprofitai.roadonly'" apk-badging.txt
+          grep -q "^sdkVersion:'29'$" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
           grep -q "application-icon-480:.*ic_launcher" apk-badging.txt
           unzip -l "$APK" | grep ic_launcher
           unzip -l "$APK" | grep "assets/almaty-osm.sqlite"
           unzip -l "$APK" | grep "assets/brouter/E75_N40.rd5"
+          unzip -l "$APK" | grep "assets/brouter/car-balanced-znay-v46.brf"
           unzip -l "$APK" | grep "assets/tessdata/rus.traineddata"
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
-          cp "$APK" ZnayTsenu-v42.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | tee apk-signing.txt
+          echo "Separate road-test package; does not overwrite installed v44/v45; data and settings are separate." | tee upgrade-compatibility.txt
+          cp "$APK" ZnayTsenu-v49-tomtom-pilot.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v42-branded-apk
-          path: ZnayTsenu-v42.apk
+          name: ZnayTsenu-v49-tomtom-pilot-branded-apk
+          path: |
+            ZnayTsenu-v49-tomtom-pilot.apk
+            apk-signing.txt
+            upgrade-compatibility.txt
           retention-days: 7
           if-no-files-found: error
 
@@ -221,12 +247,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        api: [28, 34, 36]
+        api: [29, 34, 36]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ZnayTsenu-v42-branded-apk
+          name: ZnayTsenu-v49-tomtom-pilot-branded-apk
       - name: Enable hardware virtualization
         run: sudo chmod 666 /dev/kvm
       - name: Test service and calculator overlay
@@ -236,4 +262,4 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v42.apk
+          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v49-tomtom-pilot.apk kz.taxiprofitai.roadonly

@@ -1,0 +1,66 @@
+name: Export resolved Android source for private audit
+on:
+  push:
+    branches: [fix/v47-road-only]
+    paths: ['.github/workflows/export-audit-source.yml']
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/export-audit-source.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    if: github.event_name != 'pull_request' || github.head_ref == 'fix/v47-road-only'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Reconstruct source exactly as current APK build
+        run: |
+          python3 -m pip install --disable-pip-version-check 'PyYAML==6.0.2'
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          import yaml
+          workflow = yaml.safe_load(Path(".github/workflows/build-apk.yml").read_text())
+          steps = {s.get("name"): s for s in workflow["jobs"]["build"]["steps"]}
+          for name in ("Prepare project", "Apply compact main screen", "Add local OCR and language models", "Apply approved launcher icon"):
+              script = steps[name]["run"]
+              if name == "Add local OCR and language models":
+                  anchor = "mkdir -p app/src/main/assets/tessdata"
+                  assert anchor in script
+                  script = script.split(anchor, 1)[0]
+              subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], check=True)
+          assert Path("android-project/app/src/main/java/kz/taxiprofitai/Engine.kt").is_file()
+          assert Path("android-project/app/src/main/java/kz/taxiprofitai/TomTomRouter.kt").is_file()
+          assert Path("android-project/app/src/main/java/kz/taxiprofitai/OfflineRoutePipeline.kt").is_file()
+          print("Resolved Android source generated; no SDK/network map assets downloaded.")
+          PY
+      - name: Prepare private review archive
+        run: |
+          mkdir -p audit-package
+          cp -r android-project/. audit-package/
+          cp -r docs training patches ci audit-package/
+          mkdir -p audit-package/reference
+          cp .github/workflows/build-apk.yml audit-package/reference/original-build-apk.yml
+          git rev-parse HEAD > audit-package/SOURCE_COMMIT.txt
+          cat > audit-package/README_REVIEW.txt <<'EOF'
+          Resolved Kotlin/Android source from the exact APK preparation steps, including v49.
+          app/ contains the generated current source, not the v0.17 baseline.
+          This is a review snapshot, not a newly validated APK or a migrated production repository.
+          Large runtime assets (OSM SQLite, BRouter rd5/JAR and OCR traineddata) are not generated in this export.
+          Original CI, patches and asset preparation scripts are retained for provenance and reproducibility.
+          No signing key or CI secret is intentionally exported. Do not publish this private package.
+          EOF
+          test -f audit-package/app/src/main/java/kz/taxiprofitai/TomTomRouter.kt
+          find audit-package -type f \( -name '*.jks' -o -name '*.keystore' -o -name 'local.properties' -o -name '.env' -o -name 'key.properties' \) -delete
+          find audit-package/app/src/main/java -name '*.kt' | wc -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZnayTsenu-v49-resolved-audit-source
+          path: audit-package/
+          retention-days: 7
+          if-no-files-found: error

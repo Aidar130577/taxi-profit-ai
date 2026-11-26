@@ -15,13 +15,14 @@ fi
 echo "cb83f220332de8223476e029a9b075157fb74401c69a991ceaa013486c29760f  $upstream" | sha256sum -c -
 mkdir -p "$work/src" "$work/classes" "$project/app/libs" "$project/app/src/main/assets/brouter"
 tar -xzf "$upstream" -C "$work/src" --strip-components=1
+python3 "$(dirname "$0")/brouter_shortest_core_v45.py" "$work/src"
 find "$work/src"/brouter-{core,mapaccess,codec,expressions,util}/src/main/java -name '*.java' | sort > "$work/java-files"
 javac --release 11 -encoding UTF-8 -d "$work/classes" @"$work/java-files"
 jar --create --file "$project/app/libs/brouter-1.7.10.jar" -C "$work/classes" .
 
 data="$project/app/src/main/assets/brouter"
 cp "$work/src/LICENSE" "$data/LICENSE-BRouter.txt"
-cp "$work/src/misc/profiles2/"{car-vario.brf,lookups.dat} "$data/"
+cp "$work/src/misc/profiles2/"{car-vario.brf,car-balanced-znay-v46.brf,lookups.dat} "$data/"
 if [[ -z "$segment" ]]; then
     segment="$work/E75_N40.rd5"
     curl --fail --silent --show-error --location --retry 3 --max-time 180 \
@@ -36,4 +37,5 @@ Road data © OpenStreetMap contributors. Open Database License (ODbL) 1.0.
 https://www.openstreetmap.org/copyright
 https://opendatacommons.org/licenses/odbl/1-0/
 BRouter engine and profiles: https://github.com/abrensch/brouter (MIT).
+Modified by ZnayTsenu: optional distance objective; original car-vario profile retained.
 NOTICE
