@@ -102,7 +102,13 @@ edit("PlaceLookup.kt", "    private fun normalize(text: String): String =", ''' 
         }
         // Old-style geocoder result with unstructured labels: only a unique
         // location or a tight cluster, never distant competing candidates.
-        return cluster(local)
+        val stem = order?.let(AddressMatcher::searchStem) ?: return null
+        val digits = AddressMatcher.houseDigits(order)
+        if (digits.isEmpty()) return null
+        val houseNumber = Regex("(?<![0-9])" + Regex.escape(digits) + "(?![0-9])")
+        return cluster(local.filter { c -> c.labels.any { label ->
+            label.lowercase(java.util.Locale.ROOT).contains(stem) && houseNumber.containsMatchIn(label)
+        } })
     }
 
     private fun normalize(text: String): String =''')
@@ -174,10 +180,11 @@ p.write_text(s.replace(a,'''    val weak=OfflineRoute(4.0,12.0,approximate=true,
     check(!RouteQuality.previewUsable(weak.copy(provisional=true)))
     check(!RouteQuality.previewUsable(weak.copy(approximate=false)))
     val requested="улица Пушкина, 83"
-    val unknown=PlaceLookup.Match(43.25,76.95,listOf("Алматы"))
+    val unknown=PlaceLookup.Match(43.25,76.95,listOf("83 Пушкина Алматы"))
     val wrong=PlaceLookup.Match(43.25,76.95,listOf("улица Пушкина, 38"))
     val far=PlaceLookup.Match(43.28,76.95,listOf("Алматы"))
     check(PlaceLookup.hybridFallback(requested,listOf(unknown))!=null)
+    check(PlaceLookup.hybridFallback(requested,listOf(PlaceLookup.Match(43.25,76.95,listOf("Алматы"))))==null)
     check(PlaceLookup.hybridFallback(requested,listOf(wrong))==null)
     check(PlaceLookup.hybridFallback(requested,listOf(unknown,far))==null)
     addressMatcherChecks()'''))
