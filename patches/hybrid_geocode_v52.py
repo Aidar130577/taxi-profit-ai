@@ -441,3 +441,56 @@ edit("OfferPopupView.kt", '''        c.restore()
 edit("OfferPopupView.kt", '''        val route = if (showAddresses) "А: ${pickup ?: "—"}. Б: ${destination ?: "—"}." else ""''',
 '''        val route = "А: ${pickup?.takeIf { it.isNotBlank() } ?: "Не считан"}. Б: ${destination?.takeIf { it.isNotBlank() } ?: "Не считан"}."''')
 print("Address diagnostic rows: always visible on order, no map-coordinate substitution.")
+
+
+# Stable diagnostics for screenshots; do not conflate missing text with failed geocoding.
+p=root/"RouteQuality.kt"
+p.write_text(p.read_text()+'''
+internal object OfferErrorCodes {
+    fun address(point: String, raw: String?): String =
+        raw?.trim()?.takeIf { it.isNotEmpty() } ?: "E-$point-01"
+
+    fun status(status: String, pickup: String?, destination: String?): String? = when {
+        status.startsWith("Не считаны остановки") -> "E-R02"
+        status.startsWith("Не считан") ->
+            listOfNotNull("E-A-01".takeIf { pickup.isNullOrBlank() },
+                "E-B-01".takeIf { destination.isNullOrBlank() })
+                .joinToString(" / ").ifBlank { "E-T01" }
+        status == "Тариф не считан" -> "E-T01"
+        status.startsWith("Уточните адрес") -> "E-G01 " + status.removePrefix("Уточните адрес").trim()
+        status.startsWith("Адрес не найден") -> "E-G01"
+        status == "Уточните название места" -> "E-G01"
+        status.startsWith("Нет маршрута") -> "E-R01"
+        status == "Ошибка тарифной модели" -> "E-P01"
+        status == "База комиссии неизвестна" -> "E-C01"
+        status == "За 4 сек цена не готова" -> "E-TIME"
+        status.startsWith("Предварительно") -> "W-G01"
+        else -> null
+    }
+}
+''')
+edit("OfferPopupView.kt", '            text(c, "$label: " + (raw ?: "Не считан"), 9f, baseline, 16f,',
+     '            text(c, "$label: " + OfferErrorCodes.address(if (label == "А") "A" else "B", raw), 9f, baseline, 16f,')
+edit("OfferPopupView.kt", '''        val route = "А: ${pickup?.takeIf { it.isNotBlank() } ?: "Не считан"}. Б: ${destination?.takeIf { it.isNotBlank() } ?: "Не считан"}."''',
+'''        val route = "А: ${OfferErrorCodes.address("A",pickup)}. Б: ${OfferErrorCodes.address("B",destination)}."''')
+edit("OfferPopupView.kt", '''        val route = "А: ${OfferErrorCodes.address("A",pickup)}. Б: ${OfferErrorCodes.address("B",destination)}."''',
+'''        val diagnosticCode = OfferErrorCodes.status(status, pickup, destination)
+        if (diagnosticCode != null) footer = diagnosticCode.trim()
+        val route = "А: ${OfferErrorCodes.address("A",pickup)}. Б: ${OfferErrorCodes.address("B",destination)}."''')
+edit("OfferPopupView.kt", 'text(c,if (approximateQuote) "≈ Неточный адрес" else footer,120f,108f,14f,Color.WHITE,false,Paint.Align.CENTER,228f)',
+     'text(c,if (approximateQuote) "W-G01" else footer,120f,108f,14f,Color.rgb(255,100,100),false,Paint.Align.CENTER,228f)')
+p=Path("core-tests/RouteQualityCheck.kt")
+s=p.read_text()
+a="    addressMatcherChecks()"
+assert s.count(a)==1
+p.write_text(s.replace(a,'''    check(OfferErrorCodes.address("A",null) == "E-A-01")
+    check(OfferErrorCodes.address("B"," ") == "E-B-01")
+    check(OfferErrorCodes.address("B","ул. Абая, 10") == "ул. Абая, 10")
+    check(OfferErrorCodes.status("Уточните адрес А+ Б2","А","Б") == "E-G01 А+ Б2")
+    check(OfferErrorCodes.status("Нет маршрута BRouter","А","Б") == "E-R01")
+    check(OfferErrorCodes.status("Ошибка тарифной модели","А","Б") == "E-P01")
+    check(OfferErrorCodes.status("Не считаны остановки","А","Б") == "E-R02")
+    check(OfferErrorCodes.status("За 4 сек цена не готова","А","Б") == "E-TIME")
+    check(OfferErrorCodes.status("Время Яндекс Про","А","Б") == null)
+'''+a))
+print("Stable screenshot diagnostics enabled; no raw address logging added.")
