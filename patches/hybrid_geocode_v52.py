@@ -494,3 +494,42 @@ p.write_text(s.replace(a,'''    check(OfferErrorCodes.address("A",null) == "E-A-
     check(OfferErrorCodes.status("Время Яндекс Про","А","Б") == null)
 '''+a))
 print("Stable screenshot diagnostics enabled; no raw address logging added.")
+
+
+# Owner: missing-address codes appear ONLY in their corresponding A/B row.
+# Suppress the generic footer entirely for missing-address states, reclaim space.
+edit("RouteQuality.kt", '''        status.startsWith("Не считан") ->
+            listOfNotNull("E-A-01".takeIf { pickup.isNullOrBlank() },
+                "E-B-01".takeIf { destination.isNullOrBlank() })
+                .joinToString(" / ").ifBlank { "E-T01" }''',
+'''        status.startsWith("Не считан") ->
+            if (pickup.isNullOrBlank() || destination.isNullOrBlank()) null else "E-T01"''')
+edit("RouteQuality.kt", "    fun status(status: String, pickup: String?, destination: String?): String? = when {",
+'''    fun addressFailureOnly(status: String, pickup: String?, destination: String?): Boolean =
+        status.startsWith("Не считан") && !status.startsWith("Не считаны остановки") &&
+            (pickup.isNullOrBlank() || destination.isNullOrBlank())
+
+    fun status(status: String, pickup: String?, destination: String?): String? = when {''')
+edit("OfferPopupView.kt", "    private val quoteHeight get() = if (!hasQuote || approximateQuote) 116 else 96",
+'''    private var addressFailureOnly = false
+    private val showDiagnostic get() = approximateQuote || (!hasQuote && !addressFailureOnly)
+    private val quoteHeight get() = if (showDiagnostic) 116 else 96''')
+edit("OfferPopupView.kt", '        approximateQuote = estimate != null && status.startsWith("Предварительно")',
+'''        approximateQuote = estimate != null && status.startsWith("Предварительно")
+        addressFailureOnly = OfferErrorCodes.addressFailureOnly(status, pickupAddress, destinationAddress)''')
+edit("OfferPopupView.kt", "        if (!hasQuote || approximateQuote) {", "        if (showDiagnostic) {")
+edit("OfferPopupView.kt", "        if (diagnosticCode != null) footer = diagnosticCode.trim()",
+'''        if (addressFailureOnly) footer = ""
+        else if (diagnosticCode != null) footer = diagnosticCode.trim()''')
+p=Path("core-tests/RouteQualityCheck.kt")
+s=p.read_text()
+a="    addressMatcherChecks()"
+assert s.count(a)==1
+p.write_text(s.replace(a,'''    check(OfferErrorCodes.addressFailureOnly("Не считан адрес Б","Жангельдина, 166",null))
+    check(OfferErrorCodes.status("Не считан адрес Б","Жангельдина, 166",null) == null)
+    check(OfferErrorCodes.addressFailureOnly("Не считаны адреса А и Б",null,null))
+    check(OfferErrorCodes.status("Не считаны адреса А и Б",null,null) == null)
+    check(!OfferErrorCodes.addressFailureOnly("Не считаны остановки","А","Б"))
+    check(!OfferErrorCodes.addressFailureOnly("Нет маршрута BRouter","А","Б"))
+'''+a))
+print("Missing-address codes appear only in A/B rows.")
