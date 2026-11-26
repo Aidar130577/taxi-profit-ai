@@ -14,6 +14,24 @@ edit("OfflineAlmatyIndex.kt", "    private fun findTolerant(raw: String): BRoute
      "    internal fun findTolerant(raw: String): BRouterConnector.Point? {")
 # A query hitting the SQL cap may hide a second, conflicting location.
 edit("OfflineAlmatyIndex.kt", "                while (cursor.moveToNext()) {\n                    if (AddressMatcher.matchesLabel(order, cursor.getString(2)) != null) {", "                if (cursor.count >= 600) return null\n                while (cursor.moveToNext()) {\n                    if (AddressMatcher.matchesLabel(order, cursor.getString(2)) != null) {")
+# Prioritize the exact house over nearby house suffixes in the tolerant index.
+edit("OfflineAlmatyIndex.kt", """            val found = ArrayList<BRouterConnector.Point>()
+            db.rawQuery(
+                "select lat, lon, label from places where kind = 0 and key like ? and key like ? limit 600",""", """            val full = ArrayList<BRouterConnector.Point>()
+            val near = ArrayList<BRouterConnector.Point>()
+            db.rawQuery(
+                "select lat, lon, label from places where kind = 0 and key like ? and key like ? limit 600",""")
+edit("OfflineAlmatyIndex.kt", """                    if (AddressMatcher.matchesLabel(order, cursor.getString(2)) != null) {
+                        found.add(BRouterConnector.Point(cursor.getInt(0) / 1_000_000.0, cursor.getInt(1) / 1_000_000.0))
+                    }""", """                    val level = AddressMatcher.matchesLabel(order, cursor.getString(2)) ?: continue
+                    val point = BRouterConnector.Point(cursor.getInt(0) / 1_000_000.0, cursor.getInt(1) / 1_000_000.0)
+                    if (level == AddressMatcher.Level.FULL) full.add(point) else near.add(point)""")
+edit("OfflineAlmatyIndex.kt", """            if (found.isEmpty()) return null
+            val first = found.first()
+            if (found.any { kotlin.math.abs(it.lat - first.lat) > 0.003 || kotlin.math.abs(it.lon - first.lon) > 0.004 }) {""", """            val found = full.ifEmpty { near }
+            if (found.isEmpty()) return null
+            val first = found.first()
+            if (found.any { kotlin.math.abs(it.lat - first.lat) > 0.003 || kotlin.math.abs(it.lon - first.lon) > 0.004 }) {""")
 # Preserve all strong matches, not first arbitrary POI. Narrow the cluster to ~100m.
 edit("OfflineAlmatyIndex.kt", "kotlin.math.abs(it.lat - first.lat) > 0.003 || kotlin.math.abs(it.lon - first.lon) > 0.004",
      "kotlin.math.abs(it.lat - first.lat) > 0.0009 || kotlin.math.abs(it.lon - first.lon) > 0.0012")
@@ -212,5 +230,16 @@ p.write_text(s.replace(a,'''    val weak=OfflineRoute(4.0,12.0,approximate=true,
     check(PlaceLookup.verifiedAddress(requested,listOf(
         PlaceLookup.Match(43.25,76.95,listOf("улица Пушкина, 83")),
         PlaceLookup.Match(43.28,76.95,listOf("улица Пушкина, 83")))) == null)
+    // EV field screenshot: actual address strings; synthetic coordinates only.
+    val evA = "улица Алиби Жангельдина, 166"
+    val evB = "улица Шарипа Омарова, 9"
+    val evStart = PlaceLookup.Match(43.26,76.96,listOf("улица Алиби Жангельдина 166, Алматы"))
+    val evEnd = PlaceLookup.Match(43.23,76.87,listOf("улица Шарипа Омарова, 9"))
+    val evNear = PlaceLookup.Match(43.24,76.88,listOf("улица Шарипа Омарова, 9А"))
+    val evWrong = PlaceLookup.Match(43.25,76.89,listOf("улица Шарипа Омарова, 90"))
+    check(PlaceLookup.verifiedAddress(evA,listOf(evStart)) == evStart)
+    check(PlaceLookup.verifiedAddress(evB,listOf(evNear,evWrong,evEnd)) == evEnd)
+    check(PlaceLookup.verifiedAddress(evB,listOf(evNear,evWrong)) == null)
+    check(PlaceLookup.verifiedAddress(evB,listOf(evEnd,evEnd.copy(lat=43.29))) == null)
     addressMatcherChecks()'''))
 print("v52 hybrid geocode: separate provisional road forecast, no training, overlay +20%.")
