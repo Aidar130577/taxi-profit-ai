@@ -272,3 +272,77 @@ p.write_text(s.replace(a,'''    val weak=OfflineRoute(4.0,12.0,approximate=true,
     check(runCatching { UnknownPassengerRange.format(Double.NaN) }.isFailure)
     addressMatcherChecks()'''))
 print("v52 hybrid geocode: separate provisional road forecast, no training, overlay +20%.")
+
+
+# v53 card-first: preserve exact text read from the offer, never derive addresses
+# from map markers/driver coordinates. Use full Yandex metrics for hidden stops.
+edit("Engine.kt", "val assumedEv: Boolean = false)", "val assumedEv: Boolean = false, val hiddenStops: Boolean = false)")
+edit("Engine.kt", "    private fun isRouteLine(line: String): Boolean =",
+'''    private val stopCount = Regex("""(?iu)^\s*\d+\s+останов(?:ка|ки|ок)\b.*$""")
+    private fun isRouteLine(line: String): Boolean =''')
+edit("Engine.kt", "        !offerMetadata.containsMatchIn(line) && !driverLocation.containsMatchIn(line) &&",
+'''        !stopCount.matches(line) && !offerMetadata.containsMatchIn(line) && !driverLocation.containsMatchIn(line) &&''')
+edit("Engine.kt", 'assumedEv = isOrder && !unsupported && explicitTariff == null && tariff == "Электро")',
+'''assumedEv = isOrder && !unsupported && explicitTariff == null && tariff == "Электро",
+            hiddenStops = isOrder && addresses.take(acceptIndex.coerceAtLeast(0)).any(stopCount::matches))''')
+# An isolated card may be incomplete: prefer a complete enclosing card over it.
+edit("RadarAccessibilityService.kt", "if (depth > 0 && card == null && texts.size - start >= 3 && rootBounds.height() > 0) {",
+     "if (depth > 0 && texts.size - start >= 3 && rootBounds.height() > 0) {")
+edit("RadarAccessibilityService.kt", "                    if (candidate.order) card = candidate",
+'''                    fun coverage(o: OrderTextParser.Detected?) =
+                        (if (o?.pickup != null) 1 else 0) + (if (o?.destination != null) 1 else 0)
+                    if (candidate.order && (card == null || coverage(candidate) > coverage(card))) card = candidate''')
+# Keep all card tariff, addresses and extras, and only take the map measurement
+# from the screen. A card-only parse can intentionally have no trip badge.
+edit("RadarAccessibilityService.kt", '''            isolatedCard != null && screen.order -> screen.copy(
+                pickup = isolatedCard.pickup, destination = isolatedCard.destination)''',
+'''            isolatedCard != null && screen.order -> isolatedCard.copy(
+                tripBadge = screen.tripBadge, demand = isolatedCard.demand ?: screen.demand)''')
+# Recalculate when stop information changes; do not treat 2 unknown stop
+# locations as a complete A-to-B route.
+edit("RadarAccessibilityService.kt", 'val key="${newer.pickup}|${newer.destination}|${newer.tariff}|',
+     'val key="${newer.hiddenStops}|${newer.pickup}|${newer.destination}|${newer.tariff}|')
+edit("RadarAccessibilityService.kt", '(!rememberIncoming || newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank())) {',
+     '(!rememberIncoming || newer.hiddenStops || newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank())) {')
+edit("RadarAccessibilityService.kt", '''                } else if (newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank() || rate == null) {''',
+'''                } else if (newer.hiddenStops) {
+                    routeStatus = "Не считаны остановки"
+                } else if (newer.pickup.isNullOrBlank() || newer.destination.isNullOrBlank() || rate == null) {''')
+edit("OfferPopupView.kt", 'status.startsWith("Уточните адрес") -> status',
+     'status.startsWith("Уточните адрес") || status == "Не считаны остановки" -> status')
+# Distinguish card extraction from routing in privacy-preserving logs.
+edit("RadarAccessibilityService.kt", '                    val calcStartedAt = android.os.SystemClock.elapsedRealtime()',
+'''                    Log.i("ZnayTsenuRoute", "Card addresses present; geocoding started")
+                    val calcStartedAt = android.os.SystemClock.elapsedRealtime()''')
+edit("RadarAccessibilityService.kt", '                    val submit = submit@{ route: OfflineRoute ->',
+'''                    val submit = submit@{ route: OfflineRoute ->
+                        Log.i("ZnayTsenuRoute", "Road route received; validating fare inputs")''')
+# Keep stop information and explicit tariff when OCR supplements native text.
+edit("RadarAccessibilityService.kt", '                    tariff = original.tariff ?: candidate.tariff,',
+'''                    tariff = if (original.assumedEv && !candidate.assumedEv && candidate.tariff != null)
+                        candidate.tariff else original.tariff ?: candidate.tariff,
+                    hiddenStops = original.hiddenStops || candidate.hiddenStops,
+                    assumedEv = original.assumedEv && (candidate.tariff == null || candidate.assumedEv),''')
+# Regression tests from the two field screenshots (literal text, no fabricated route).
+p=Path("core-tests/OfferDemandCheck.kt")
+s=p.read_text()
+import re
+m=re.search(r'(?m)^fun main\s*\([^)]*\)\s*\{',s)
+assert m is not None
+a=m.group(0)
+# Kotlin literals in generated source need escaped newlines.
+checks=r'''
+    val fieldEv = OrderTextParser.parse("Пропустить\n3,1 км · 6 мин\nДальняя подача\nЭлектро\nА: улица Алиби Жангельдина, 166\nБ: улица Шарипа Омарова, 9\nПассажир\nПринять +100 ₸", cardOnly = true)
+    check(fieldEv.pickup == "улица Алиби Жангельдина, 166")
+    check(fieldEv.destination == "улица Шарипа Омарова, 9")
+    check(fieldEv.tariff == "Электро" && !fieldEv.assumedEv && !fieldEv.hiddenStops)
+    check(fieldEv.tripBadge == null && fieldEv.pickupKm == 3.1)
+    val fieldFasten = OrderTextParser.parse("Пропустить\nБ 27 км 45 мин\n800 м · 3 мин\nБлижняя подача\nА: улица Абдуллы Розыбакиева, 247А\n2 остановки\nБ: проспект Назарбаева, 179\nПассажир\nПринять ×1.00")
+    check(fieldFasten.pickup == "улица Абдуллы Розыбакиева, 247А")
+    check(fieldFasten.destination == "проспект Назарбаева, 179")
+    check(fieldFasten.assumedEv && fieldFasten.hiddenStops)
+    check(fieldFasten.tripBadge == TripBadge(27.0,45))
+    check(fieldFasten.pickupKm == 0.8)
+'''
+p.write_text(s.replace(a,a+checks,1))
+print("Card-first and hidden-stop regressions applied.")
