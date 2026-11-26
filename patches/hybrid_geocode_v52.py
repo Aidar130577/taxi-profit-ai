@@ -203,6 +203,31 @@ edit("OfferPopupView.kt", '''        if (!hasQuote) {
         }''')
 edit("OfferPopupView.kt", "            val y = if (hasQuote) 96f else 116f", "            val y = quoteHeight.toFloat()")
 
+# Unknown passenger orders: hide EV proxy, display a broad experimental range.
+# Exact prices from the order itself always keep priority. No official Fasten
+# tariff is assumed; the initial +/-20% band is explicitly uncalibrated.
+p=root/"RouteQuality.kt"
+p.write_text(p.read_text()+'''
+internal object UnknownPassengerRange {
+    fun format(value: Double): String {
+        require(value.isFinite() && value >= 0.0)
+        val low = (kotlin.math.floor(value * 0.8 / 50.0) * 50.0).toLong()
+        val high = (kotlin.math.ceil(value * 1.2 / 50.0) * 50.0).toLong()
+        return "$low–$high"
+    }
+}
+''')
+edit("OfferPopupView.kt", '        demandText = demand.filterNot { it == \'₸\' || it.isWhitespace() || Character.isSpaceChar(it) }',
+     '''        if (assumedEv) title = "Fasten / корп."
+        demandText = demand.filterNot { it == '₸' || it.isWhitespace() || Character.isSpaceChar(it) }''')
+edit("OfferPopupView.kt", '''        net="НА РУКИ ${quote.takeHomeText}"''', '''        net="НА РУКИ ${quote.takeHomeText}"
+        if (assumedEv && estimate != null && !estimate.fromOrder) {
+            gross = "СТОИМОСТЬ " + UnknownPassengerRange.format(estimate.gross)
+            net = "НА РУКИ " + (estimate.net?.let(UnknownPassengerRange::format) ?: "—")
+        }''')
+edit("OfferPopupView.kt", '''            text(c,"Возможно корпоративный",120f,y+15f,15f,Color.WHITE,false,Paint.Align.CENTER,228f)
+            text(c,"или Fasten",120f,y+30f,15f,Color.WHITE,false,Paint.Align.CENTER,228f)''', '''            text(c,"Fasten / корпоративный",120f,y+15f,15f,Color.WHITE,false,Paint.Align.CENTER,228f)
+            text(c,if (hasQuote) "Цена или оценка по маршруту" else "Тариф не указан",120f,y+30f,13f,Color.WHITE,false,Paint.Align.CENTER,228f)''')
 # The existing TomTom pilot and adaptive calculation remain unchanged.
 p=Path("core-tests/RouteQualityCheck.kt")
 s=p.read_text()
@@ -241,5 +266,9 @@ p.write_text(s.replace(a,'''    val weak=OfflineRoute(4.0,12.0,approximate=true,
     check(PlaceLookup.verifiedAddress(evB,listOf(evNear,evWrong,evEnd)) == evEnd)
     check(PlaceLookup.verifiedAddress(evB,listOf(evNear,evWrong)) == null)
     check(PlaceLookup.verifiedAddress(evB,listOf(evEnd,evEnd.copy(lat=43.29))) == null)
+    check(UnknownPassengerRange.format(4000.0) == "3200–4800")
+    check(UnknownPassengerRange.format(1001.0) == "800–1250")
+    check(UnknownPassengerRange.format(0.0) == "0–0")
+    check(runCatching { UnknownPassengerRange.format(Double.NaN) }.isFailure)
     addressMatcherChecks()'''))
 print("v52 hybrid geocode: separate provisional road forecast, no training, overlay +20%.")
