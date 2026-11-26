@@ -565,9 +565,9 @@ r'''    private val terminal2Names = listOf(
         lat in 43.340..43.360 && lon in 77.000..77.025
 
     fun queries(raw: String): List<String> {''')
-edit("PlaceLookup.kt", "        return listOf(raw, expanded, name).filter(String::isNotBlank).distinct()",
+edit("PlaceLookup.kt", "        return listOfNotNull(streetAddress(name), raw, expanded, name).filter(String::isNotBlank).distinct()",
 '''        val aliases = airportTerminalAliases(name)
-        return if (aliases.isEmpty()) listOf(raw, expanded, name).filter(String::isNotBlank).distinct()
+        return if (aliases.isEmpty()) listOfNotNull(streetAddress(name), raw, expanded, name).filter(String::isNotBlank).distinct()
             else (listOf(raw) + aliases.filter { it.length > 2 && it != name } + name).distinct()''')
 # The last item must retain the original requested name even when already first.
 edit("PlaceLookup.kt", 'else (listOf(raw) + aliases.filter { it.length > 2 && it != name } + name).distinct()',
