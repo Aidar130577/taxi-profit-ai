@@ -40,8 +40,10 @@ edit("LearnedRates.kt", '!it.excluded && it.tariff == rate.title', '!it.excluded
 edit("RadarAccessibilityService.kt", 'DualFareMean.combinedRoute(badgeRoute, route, DualFareMean.fixedDemand(newer.demand)) else null', 'runCatching { DualFareMean.combinedRoute(badgeRoute, route, DualFareMean.fixedDemand(newer.demand)) }.getOrNull() else null')
 p=Path("core-tests/OfferDemandCheck.kt")
 s=p.read_text()
-a='fun main() {'
-assert s.count(a)==1
+import re
+m=re.search(r'(?m)^fun main\s*\([^)]*\)\s*\{',s)
+assert m is not None
+a=m.group(0)
 s=s.replace(a,a+'''
     val unknownPassenger = "Пропустить\\nБлижняя подача\\nА: Абая, 10\\nБ: Достык, 50\\nПассажир\\nПринять"
     check(OrderTextParser.parse(unknownPassenger).assumedEv)
