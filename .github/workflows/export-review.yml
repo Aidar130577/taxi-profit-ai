@@ -1,6 +1,9 @@
 name: Export source for private technical review
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main, fix/v43-stability, fix/v44-hyperos-recovery, fix/v45-route-diagnostics]
+    paths: ['.github/workflows/export-review.yml']
   push:
     branches: [fix/v47-road-only]
     paths: ['.github/workflows/export-review.yml']
