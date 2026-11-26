@@ -533,3 +533,96 @@ p.write_text(s.replace(a,'''    check(OfferErrorCodes.addressFailureOnly("Не �
     check(!OfferErrorCodes.addressFailureOnly("Нет маршрута BRouter","А","Б"))
 '''+a))
 print("Missing-address codes appear only in A/B rows.")
+
+
+# Field defect: both card addresses read, but named airport terminal rejected.
+# The airport site calls the international terminal T2; do not substitute
+# the airport reference point, domestic terminal, VIP, or runway.
+edit("PlaceLookup.kt", "    fun queries(raw: String): List<String> {",
+r'''    private val terminal2Names = listOf(
+        "Алматы Аэропорт, Международный терминал",
+        "Международный аэропорт Алматы – Международный терминал",
+        "Международный терминал аэропорта Алматы",
+        "Терминал международных авиалиний",
+        "Новый международный терминал",
+        "Новый международный терминал (Т2)",
+        "Международный терминал",
+        "Международный терминал Т2",
+        "New International Terminal (Т2)",
+        "New International Terminal (T2)",
+        "International Terminal T2",
+        "Т2",
+        "T2"
+    )
+    private fun terminalKey(raw: String): String =
+        raw.lowercase(java.util.Locale.ROOT).replace('ё','е').replace('т','t')
+            .replace(Regex("""[^\p{L}\p{N}]+""")," ").trim()
+    fun airportTerminalAliases(raw: String): List<String> =
+        if (terminal2Names.any { terminalKey(it) == terminalKey(raw) }) terminal2Names else emptyList()
+
+    // Airport passenger-terminal district, not a destination coordinate.
+    fun terminalDistrict(lat: Double, lon: Double): Boolean =
+        lat in 43.340..43.360 && lon in 77.000..77.025
+
+    fun queries(raw: String): List<String> {''')
+edit("PlaceLookup.kt", "        return listOf(raw, expanded, name).filter(String::isNotBlank).distinct()",
+'''        val aliases = airportTerminalAliases(name)
+        return if (aliases.isEmpty()) listOf(raw, expanded, name).filter(String::isNotBlank).distinct()
+            else (listOf(raw) + aliases.filter { it.length > 2 && it != name } + name).distinct()''')
+# The last item must retain the original requested name even when already first.
+edit("PlaceLookup.kt", 'else (listOf(raw) + aliases.filter { it.length > 2 && it != name } + name).distinct()',
+     'else (listOf(raw) + aliases.filter { it.length > 2 }).distinct().filter { it != name } + name')
+edit("PlaceLookup.kt", "        val key = normalize(name)",
+'''        val aliases = airportTerminalAliases(name)
+        if (aliases.isNotEmpty()) {
+            val keys = aliases.filter { it.length > 2 }.map(::terminalKey).toSet()
+            val hits = matches.filter { item ->
+                terminalDistrict(item.lat,item.lon) && item.labels.any { label ->
+                    terminalKey(label) in keys || label.split(',').any { terminalKey(it) in keys }
+                }
+            }
+            val first = hits.firstOrNull() ?: return null
+            return first.takeIf { hits.all {
+                kotlin.math.abs(it.lat-first.lat) <= 0.0008 &&
+                    kotlin.math.abs(it.lon-first.lon) <= 0.001
+            } }
+        }
+        val key = normalize(name)''')
+# Try exact named-POI aliases in the existing local OSM index before Android
+# geocoder. Never accept a city-wide terminal name or airfield centroid.
+edit("OfflineRoutePipeline.kt", '''            else runCatching { offlineAlmaty.findExact(raw) }.getOrNull()
+                ?: LearnedPlaces.find(appContext, raw)''',
+'''            else {
+                val aliases = PlaceLookup.airportTerminalAliases(raw)
+                if (aliases.isEmpty()) runCatching { offlineAlmaty.findExact(raw) }.getOrNull()
+                    ?: LearnedPlaces.find(appContext, raw)
+                else {
+                    val points = aliases.filter { it.length > 2 }.mapNotNull { name ->
+                        runCatching { offlineAlmaty.findExact(name) }.getOrNull()
+                            ?.takeIf { PlaceLookup.terminalDistrict(it.lat,it.lon) }
+                    }
+                    val first = points.firstOrNull()
+                    first?.takeIf { point -> points.all {
+                        kotlin.math.abs(it.lat-point.lat) <= 0.0008 &&
+                            kotlin.math.abs(it.lon-point.lon) <= 0.001
+                    } }
+                }
+            }''')
+p=Path("core-tests/RouteQualityCheck.kt")
+s=p.read_text()
+a="    addressMatcherChecks()"
+assert s.count(a)==1
+p.write_text(s.replace(a,'''    // Synthetic points for identity checks only, not real terminal coordinates.
+    val airportOrder = "Алматы Аэропорт, Международный терминал"
+    val t2 = PlaceLookup.Match(43.350,77.012,listOf("New International Terminal (Т2)"))
+    val t1 = PlaceLookup.Match(43.348,77.012,listOf("Внутренний терминал"))
+    val genericAirport = PlaceLookup.Match(43.355,77.042,listOf("Международный аэропорт Алматы"))
+    check(PlaceLookup.queries(airportOrder).contains("New International Terminal (Т2)"))
+    check(PlaceLookup.queries(airportOrder).last() == airportOrder)
+    check(PlaceLookup.namedMatch(airportOrder,listOf(t1,genericAirport,t2)) == t2)
+    check(PlaceLookup.namedMatch(airportOrder,listOf(t1,genericAirport)) == null)
+    check(PlaceLookup.namedMatch(airportOrder,listOf(t2.copy(lat=43.25))) == null)
+    check(PlaceLookup.airportTerminalAliases("Алматы Аэропорт, Внутренний терминал").isEmpty())
+    check(PlaceLookup.namedMatch(airportOrder,listOf(t2,t2.copy(lat=43.353))) == null)
+'''+a))
+print("Airport terminal T2 alias regression added; real route still requires field test.")
