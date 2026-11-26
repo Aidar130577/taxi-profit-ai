@@ -129,6 +129,7 @@ jobs:
           python3 ../patches/shortest_route_v45.py
           python3 ../patches/road_only_v47.py
           python3 ../patches/dual_fare_v47.py
+          python3 ../patches/passenger_warning_v48.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -153,7 +154,7 @@ jobs:
           assert 'minSdk = 26' in s
           assert 'applicationId = "kz.taxiprofitai"' in s
           s = s.replace('applicationId = "kz.taxiprofitai"', 'applicationId = "kz.taxiprofitai.roadonly"')
-          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 47').replace('0.17.0-approved-overlays', '0.47.0-roadonly'))
+          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 48').replace('0.17.0-approved-overlays', '0.48.0-passenger-warning'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -210,7 +211,7 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='47'" apk-badging.txt
+          grep -q "versionCode='48'" apk-badging.txt
           grep -q "package: name='kz.taxiprofitai.roadonly'" apk-badging.txt
           grep -q "^sdkVersion:'29'$" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
@@ -223,12 +224,12 @@ jobs:
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | tee apk-signing.txt
           echo "Separate road-test package; does not overwrite installed v44/v45; data and settings are separate." | tee upgrade-compatibility.txt
-          cp "$APK" ZnayTsenu-v47-roadonly.apk
+          cp "$APK" ZnayTsenu-v48-adaptive.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v47-roadonly-branded-apk
+          name: ZnayTsenu-v48-adaptive-branded-apk
           path: |
-            ZnayTsenu-v47-roadonly.apk
+            ZnayTsenu-v48-adaptive.apk
             apk-signing.txt
             upgrade-compatibility.txt
           retention-days: 7
@@ -247,7 +248,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ZnayTsenu-v47-roadonly-branded-apk
+          name: ZnayTsenu-v48-adaptive-branded-apk
       - name: Enable hardware virtualization
         run: sudo chmod 666 /dev/kvm
       - name: Test service and calculator overlay
@@ -257,4 +258,4 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v47-roadonly.apk kz.taxiprofitai.roadonly
+          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v48-adaptive.apk kz.taxiprofitai.roadonly
