@@ -129,3 +129,6 @@ fun main() {
 }
 ''')
 print("v50 strict geocoding, route comparison, safe diagnostics applied.")
+
+import runpy
+runpy.run_path(str(Path(__file__).with_name("address_tolerant_v51.py")))
