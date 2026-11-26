@@ -19,7 +19,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Prepare project
@@ -158,7 +158,7 @@ jobs:
           assert 'minSdk = 26' in s
           assert 'applicationId = "kz.taxiprofitai"' in s
           s = s.replace('applicationId = "kz.taxiprofitai"', 'applicationId = "kz.taxiprofitai.roadonly"')
-          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 53').replace('0.17.0-approved-overlays', '0.53.0-card-first'))
+          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 54').replace('0.17.0-approved-overlays', '0.54.0-expanded-catalog'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -203,6 +203,41 @@ jobs:
             'https://download.geofabrik.de/asia/kazakhstan-latest.osm.pbf' -o "$RUNNER_TEMP/kazakhstan.osm.pbf"
           PYTHONPATH="$RUNNER_TEMP/osm-python" python3 patches/build_almaty_index.py \
             "$RUNNER_TEMP/kazakhstan.osm.pbf" android-project/app/src/main/assets/almaty-osm.sqlite
+      - name: Download and validate additional Almaty catalogs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/almaty-catalogs" catalog-report
+          python3 -m venv "$RUNNER_TEMP/overture"
+          "$RUNNER_TEMP/overture/bin/pip" install 'overturemaps==2.1.1'
+          cli="$RUNNER_TEMP/overture/bin/overturemaps"
+          "$cli" download --help
+          bbox=76.70,43.12,77.17,43.45
+          for theme in place address building segment; do
+            (
+              if timeout 360 "$cli" download --bbox="$bbox" -f geojsonseq --type="$theme" -o "$RUNNER_TEMP/almaty-catalogs/$theme.geojsonseq"; then
+                echo "$theme: downloaded" > "catalog-report/$theme.status"
+              else
+                rm -f "$RUNNER_TEMP/almaty-catalogs/$theme.geojsonseq"
+                echo "$theme: unavailable" > "catalog-report/$theme.status"
+              fi
+            ) &
+          done
+          wait
+          cat catalog-report/*.status
+          curl --fail --location --retry 2 --max-time 60 'https://docs.overturemaps.org/attribution/' -o catalog-report/overture-attribution.html
+          curl --fail --location --retry 2 --max-time 60 'https://cdla.dev/permissive-2-0/' -o catalog-report/CDLA-Permissive-2.0.html
+          curl --fail --location --retry 2 --max-time 60 'https://www.apache.org/licenses/LICENSE-2.0.txt' -o catalog-report/Apache-2.0.txt
+          PYTHONPATH="$RUNNER_TEMP/osm-python" python3 patches/enrich_almaty_catalog.py \
+            android-project/app/src/main/assets/almaty-osm.sqlite "$RUNNER_TEMP/almaty-catalogs" catalog-report/overture-almaty.sqlite | tee catalog-report/import.log
+          cp catalog-report/overture-attribution.html catalog-report/CDLA-Permissive-2.0.html catalog-report/Apache-2.0.txt android-project/app/src/main/assets/
+          cp android-project/app/src/main/assets/almaty-osm.sqlite catalog-report/almaty-osm-enriched.sqlite
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Almaty-expanded-catalogs-v54
+          path: catalog-report/
+          retention-days: 7
+          if-no-files-found: error
       - name: Prepare and test the embedded BRouter engine
         run: |
           bash patches/prepare_embedded_router.sh android-project
@@ -218,7 +253,7 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='53'" apk-badging.txt
+          grep -q "versionCode='54'" apk-badging.txt
           grep -q "package: name='kz.taxiprofitai.roadonly'" apk-badging.txt
           grep -q "^sdkVersion:'29'$" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
@@ -231,12 +266,12 @@ jobs:
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | tee apk-signing.txt
           echo "Separate road-test package; does not overwrite installed v44/v45; data and settings are separate." | tee upgrade-compatibility.txt
-          cp "$APK" ZnayTsenu-v53-card-first.apk
+          cp "$APK" ZnayTsenu-v54-expanded-catalog.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v53-card-first-branded-apk
+          name: ZnayTsenu-v54-expanded-catalog-branded-apk
           path: |
-            ZnayTsenu-v53-card-first.apk
+            ZnayTsenu-v54-expanded-catalog.apk
             apk-signing.txt
             upgrade-compatibility.txt
           retention-days: 7
@@ -255,7 +290,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ZnayTsenu-v53-card-first-branded-apk
+          name: ZnayTsenu-v54-expanded-catalog-branded-apk
       - name: Enable hardware virtualization
         run: sudo chmod 666 /dev/kvm
       - name: Test service and calculator overlay
@@ -265,4 +300,4 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v53-card-first.apk kz.taxiprofitai.roadonly
+          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v54-expanded-catalog.apk kz.taxiprofitai.roadonly
