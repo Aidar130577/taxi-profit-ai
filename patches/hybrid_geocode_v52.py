@@ -417,3 +417,27 @@ s=s[:a]+'''    check(UnknownPassengerRange.bounds(3000.0,3500.0) == "3000–3500
 '''+s[b:]
 p.write_text(s)
 print("Unknown passenger: Comfort to Comfort+ range, no EV rate.")
+
+
+# Owner requests persistent card-address diagnostics during field trials.
+# Show raw extracted address text even when routing or pricing fails.
+edit("OfferPopupView.kt", "    private val logicalHeight get() = if (waiting) 38 else quoteHeight + if (assumedEv) 36 else 0",
+'''    private val addressTop get() = quoteHeight + if (assumedEv) 36 else 0
+    private val logicalHeight get() = if (waiting) 38 else addressTop + 48''')
+edit("OfferPopupView.kt", '''        c.restore()
+        if (hasQuote) onPriceDrawn?.invoke()''',
+'''        val addressY = addressTop.toFloat()
+        line(c,addressY)
+        fun addressRow(label: String, address: String?, baseline: Float) {
+            val raw = address?.trim()?.takeIf { it.isNotEmpty() }
+            text(c, "$label: " + (raw ?: "Не считан"), 9f, baseline, 16f,
+                if (raw == null) Color.rgb(255, 100, 100) else Color.WHITE,
+                false, Paint.Align.LEFT, 222f)
+        }
+        addressRow("А", pickup, addressY + 19f)
+        addressRow("Б", destination, addressY + 39f)
+        c.restore()
+        if (hasQuote) onPriceDrawn?.invoke()''')
+edit("OfferPopupView.kt", '''        val route = if (showAddresses) "А: ${pickup ?: "—"}. Б: ${destination ?: "—"}." else ""''',
+'''        val route = "А: ${pickup?.takeIf { it.isNotBlank() } ?: "Не считан"}. Б: ${destination?.takeIf { it.isNotBlank() } ?: "Не считан"}."''')
+print("Address diagnostic rows: always visible on order, no map-coordinate substitution.")
