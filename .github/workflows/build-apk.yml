@@ -130,6 +130,7 @@ jobs:
           python3 ../patches/road_only_v47.py
           python3 ../patches/dual_fare_v47.py
           python3 ../patches/passenger_warning_v48.py
+          python3 ../patches/eta_training_export_v48.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
