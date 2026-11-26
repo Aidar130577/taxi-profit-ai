@@ -351,3 +351,69 @@ checks=r'''
 '''
 p.write_text(s.replace(a,a+checks,1))
 print("Card-first and hidden-stop regressions applied.")
+
+
+# Owner 27 Nov: unknown passenger orders use Comfort / Comfort+ bounds.
+# assumedEv remains solely a legacy unknown-class compatibility flag.
+edit("Engine.kt", "val fromOrder: Boolean = false)", 
+     "val fromOrder: Boolean = false, val upperGross: Double? = null, val upperNet: Double? = null)")
+edit("RadarAccessibilityService.kt", "val rate = TarifCatalog.forName(newer.tariff)",
+     'val rate = TarifCatalog.forName(if (newer.assumedEv) "Комфорт" else newer.tariff)')
+edit("RadarAccessibilityService.kt", "                val shown = newer.displayedGross",
+'''                fun quoteFor(reference: TariffRate, route: OfflineRoute, demand: Demand): LiveFareEstimate {
+                    val lower = RouteFareEstimator.calculateWithCommission(reference, route, demand, yandex, park,
+                        loyalty, newer.verifiedHighDemandDiscount, pickupExtras(newer))
+                    if (!newer.assumedEv) return lower
+                    val upperRate = requireNotNull(TarifCatalog.forName("Комфорт+"))
+                    val upper = RouteFareEstimator.calculateWithCommission(upperRate, route, demand,
+                        CommissionSettings.percent(prefs, upperRate.title), park,
+                        loyalty, newer.verifiedHighDemandDiscount, pickupExtras(newer))
+                    return lower.copy(upperGross = upper.gross, upperNet = upper.net)
+                }
+                val shown = newer.displayedGross''')
+p=root/"RadarAccessibilityService.kt"
+s=p.read_text()
+import re
+pattern=r'RouteFareEstimator\.calculateWithCommission\((effective|rate),\s*(route|yr|adjusted|hybrid),\s*(demand|commonDemand),\s*yandex,\s*park,\s*loyalty,\s*newer\.verifiedHighDemandDiscount,\s*pickupExtras\(newer\)\)'
+s,n=re.subn(pattern,r'quoteFor(\1, \2, \3)',s)
+assert n==5,("fare paths",n)
+p.write_text(s)
+edit("OfferPopupView.kt", '''            gross = "СТОИМОСТЬ " + UnknownPassengerRange.format(estimate.gross)
+            net = "НА РУКИ " + (estimate.net?.let(UnknownPassengerRange::format) ?: "—")''',
+'''            gross = "СТОИМОСТЬ " + UnknownPassengerRange.bounds(estimate.gross, estimate.upperGross)
+            net = "НА РУКИ " + UnknownPassengerRange.bounds(estimate.net, estimate.upperNet)''')
+edit("OfferPopupView.kt", 'if (assumedEv) title = "Fasten / корп."', 'if (assumedEv) title = "Тариф не указан"')
+edit("OfferPopupView.kt", 'text(c,"Fasten / корпоративный",120f,y+15f,15f,Color.WHITE,false,Paint.Align.CENTER,228f)',
+     'text(c,"Возможно корпоративный",120f,y+15f,15f,Color.WHITE,false,Paint.Align.CENTER,228f)')
+edit("OfferPopupView.kt", 'text(c,if (hasQuote) "Цена или оценка по маршруту" else "Тариф не указан",120f,y+30f,13f,Color.WHITE,false,Paint.Align.CENTER,228f)',
+     'text(c,"или Fasten",120f,y+30f,15f,Color.WHITE,false,Paint.Align.CENTER,228f)')
+p=root/"RouteQuality.kt"
+s=p.read_text()
+a=s.index("internal object UnknownPassengerRange {")
+s=s[:a]+'''internal object UnknownPassengerRange {
+    fun bounds(a: Double?, b: Double?): String {
+        if (a == null || b == null || !a.isFinite() || !b.isFinite() || a < 0 || b < 0) return "—"
+        val low = kotlin.math.round(minOf(a,b)).toLong()
+        val high = kotlin.math.round(maxOf(a,b)).toLong()
+        return "$low–$high"
+    }
+}
+'''
+p.write_text(s)
+p=Path("core-tests/RouteQualityCheck.kt")
+s=p.read_text()
+a=s.index("    check(UnknownPassengerRange.format(4000.0)")
+b=s.index("    addressMatcherChecks()",a)
+s=s[:a]+'''    check(UnknownPassengerRange.bounds(3000.0,3500.0) == "3000–3500")
+    check(UnknownPassengerRange.bounds(3500.0,3000.0) == "3000–3500")
+    check(UnknownPassengerRange.bounds(null,3000.0) == "—")
+    check(UnknownPassengerRange.bounds(Double.NaN,3000.0) == "—")
+    val cRoute = OfflineRoute(12.0,25.0)
+    val cDemand = Demand(DemandType.FIXED_ADD,100.0)
+    val comfort = RouteFareEstimator.calculate(TarifCatalog.forName("Комфорт")!!, cRoute, cDemand, 19.2, 1.0)
+    val comfortPlus = RouteFareEstimator.calculate(TarifCatalog.forName("Комфорт+")!!, cRoute, cDemand, 19.2, 1.0)
+    check(comfort.gross < comfortPlus.gross)
+    check(comfort.net!! < comfortPlus.net!!)
+'''+s[b:]
+p.write_text(s)
+print("Unknown passenger: Comfort to Comfort+ range, no EV rate.")
