@@ -134,6 +134,7 @@ jobs:
           python3 ../patches/tomtom_pilot_v49.py
           python3 ../patches/exact_geocode_v50.py
           python3 ../patches/hybrid_geocode_v52.py
+          python3 ../patches/smart_geocode_v55.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -158,7 +159,7 @@ jobs:
           assert 'minSdk = 26' in s
           assert 'applicationId = "kz.taxiprofitai"' in s
           s = s.replace('applicationId = "kz.taxiprofitai"', 'applicationId = "kz.taxiprofitai.roadonly"')
-          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 54').replace('0.17.0-approved-overlays', '0.54.0-expanded-catalog'))
+          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 55').replace('0.17.0-approved-overlays', '0.55.0-smart-geocode'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -231,10 +232,11 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/osm-python" python3 patches/enrich_almaty_catalog.py \
             android-project/app/src/main/assets/almaty-osm.sqlite "$RUNNER_TEMP/almaty-catalogs" catalog-report/overture-almaty.sqlite | tee catalog-report/import.log
           cp catalog-report/overture-attribution.html catalog-report/CDLA-Permissive-2.0.html catalog-report/Apache-2.0.txt android-project/app/src/main/assets/
+          PYTHONPATH="$RUNNER_TEMP/osm-python" python3 patches/build_smart_index_v55.py android-project/app/src/main/assets/almaty-osm.sqlite | tee catalog-report/smart-index.log
           cp android-project/app/src/main/assets/almaty-osm.sqlite catalog-report/almaty-osm-enriched.sqlite
       - uses: actions/upload-artifact@v4
         with:
-          name: Almaty-expanded-catalogs-v54
+          name: Almaty-expanded-catalogs-v55
           path: catalog-report/
           retention-days: 7
           if-no-files-found: error
@@ -253,7 +255,7 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='54'" apk-badging.txt
+          grep -q "versionCode='55'" apk-badging.txt
           grep -q "package: name='kz.taxiprofitai.roadonly'" apk-badging.txt
           grep -q "^sdkVersion:'29'$" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
@@ -266,12 +268,12 @@ jobs:
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | tee apk-signing.txt
           echo "Separate road-test package; does not overwrite installed v44/v45; data and settings are separate." | tee upgrade-compatibility.txt
-          cp "$APK" ZnayTsenu-v54-expanded-catalog.apk
+          cp "$APK" ZnayTsenu-v55-smart-geocode.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v54-expanded-catalog-branded-apk
+          name: ZnayTsenu-v55-smart-geocode-branded-apk
           path: |
-            ZnayTsenu-v54-expanded-catalog.apk
+            ZnayTsenu-v55-smart-geocode.apk
             apk-signing.txt
             upgrade-compatibility.txt
           retention-days: 7
@@ -290,7 +292,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ZnayTsenu-v54-expanded-catalog-branded-apk
+          name: ZnayTsenu-v55-smart-geocode-branded-apk
       - name: Enable hardware virtualization
         run: sudo chmod 666 /dev/kvm
       - name: Test service and calculator overlay
@@ -300,4 +302,4 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v54-expanded-catalog.apk kz.taxiprofitai.roadonly
+          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v55-smart-geocode.apk kz.taxiprofitai.roadonly
