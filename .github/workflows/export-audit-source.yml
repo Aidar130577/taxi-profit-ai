@@ -3,15 +3,21 @@ on:
   push:
     branches: [fix/v47-road-only]
     paths: ['.github/workflows/export-audit-source.yml']
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/export-audit-source.yml']
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   export:
+    if: github.event_name != 'pull_request' || github.head_ref == 'fix/v47-road-only'
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Reconstruct source exactly as current APK build
         run: |
           python3 -m pip install --disable-pip-version-check 'PyYAML==6.0.2'
