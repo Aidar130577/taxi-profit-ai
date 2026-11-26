@@ -16,8 +16,8 @@ ACTIONS = re.compile(r"[^\w]+|_", re.U)
 PREFIX = re.compile(r"^(?:кафе|кофейня|ресторан|магазин|трц|тц|бц|жк|здание|отель|гостиница)\s+")
 STREET = re.compile(r"\b(?:улица|ул|проспект|просп|пр|микрорайон|мкр|көшесі|даңғылы|street|avenue)\b")
 CORPUS = re.compile(r"(\d+[а-яa-z]?)\s*(?:корпус|корп|к|k)\s*(\d+[а-яa-z]?)\b")
-POI = ("amenity", "shop", "tourism", "office", "healthcare", "leisure", "building", "public_transport", "railway", "craft", "sport")
-NAME_KEYS = ("name", "name:ru", "name:kk", "name:en", "alt_name", "official_name", "short_name")
+POI = ("amenity", "shop", "tourism", "office", "healthcare", "leisure", "building", "public_transport", "railway", "craft", "sport", "aeroway", "historic", "man_made", "emergency", "entrance")
+NAME_KEYS = ("name", "name:ru", "name:kk", "name:en", "alt_name", "official_name", "short_name", "old_name", "old_name:ru", "old_name:kk", "alt_name:ru", "alt_name:kk", "loc_name", "int_name", "official_name:ru", "official_name:kk")
 
 
 def normalize(text, is_address):
@@ -78,6 +78,16 @@ class Extract(osmium.SimpleHandler):
             self.add(node.tags, loc.lat, loc.lon)
 
     def way(self, way):
+        # Retain road name variants without using street centroids as houses.
+        if way.tags.get("highway") and any(way.tags.get(k) for k in NAME_KEYS):
+            points = [(n.lat, n.lon) for n in way.nodes if n.location.valid()]
+            if any(in_bounds(lat, lon) for lat, lon in points):
+                names = {v.strip() for k in NAME_KEYS for v in (way.tags.get(k) or "").split(";") if v.strip()}
+                primary = way.tags.get("name")
+                if primary:
+                    self.db.executemany("insert or ignore into street_names values (?,?,?)",
+                        [(normalize(primary, True), normalize(v, True), v) for v in names])
+
         if not self.relevant(way.tags):
             return
         points = [(n.lat, n.lon) for n in way.nodes if n.location.valid()]
@@ -106,6 +116,7 @@ def main():
             create table places (key text not null, kind integer not null, lat integer not null,
                 lon integer not null, label text not null,
                 primary key(key, kind, lat, lon)) without rowid;
+            create table street_names (street text not null, alias text not null, label text not null, primary key(street,alias,label)) without rowid;
             create table metadata (key text primary key, value text not null) without rowid;
         """)
         with osmium.io.Reader(str(args.pbf)) as source:
@@ -113,6 +124,19 @@ def main():
         extract = Extract(db)
         extract.apply_file(str(args.pbf), locations=True)
         extract.flush()
+        db.execute("create index street_alias_lookup on street_names(alias)")
+        # Copy existing house coordinates for unambiguous street aliases only.
+        # Never derive a house coordinate from a street midpoint.
+        db.execute("""
+            insert or ignore into places
+            select n.alias || substr(p.key,length(n.street)+1), 0,p.lat,p.lon,p.label
+            from street_names n join places p on p.kind=0
+              and p.key >= n.street || ' ' and p.key < n.street || '!'
+            where length(n.alias)>=3 and n.alias != n.street
+              and (select count(distinct street) from street_names s where s.alias=n.alias)=1
+              and not exists (select 1 from street_names s where s.street=n.alias and s.street!=n.street)
+              and substr(p.key,length(n.street)+2,1) between '0' and '9'
+        """)
         db.executemany("insert into metadata values (?, ?)", [
             ("source", SOURCE), ("attribution", ATTRIBUTION), ("snapshot", source_date),
             ("bounds", ",".join(str(v) for v in BOUNDS)),
