@@ -278,7 +278,7 @@ print("v52 hybrid geocode: separate provisional road forecast, no training, over
 # from map markers/driver coordinates. Use full Yandex metrics for hidden stops.
 edit("Engine.kt", "val assumedEv: Boolean = false)", "val assumedEv: Boolean = false, val hiddenStops: Boolean = false)")
 edit("Engine.kt", "    private fun isRouteLine(line: String): Boolean =",
-'''    private val stopCount = Regex("""(?iu)^\s*\d+\s+останов(?:ка|ки|ок)\b.*$""")
+r'''    private val stopCount = Regex("""(?iu)^\s*\d+\s+останов(?:ка|ки|ок)\b.*$""")
     private fun isRouteLine(line: String): Boolean =''')
 edit("Engine.kt", "        !offerMetadata.containsMatchIn(line) && !driverLocation.containsMatchIn(line) &&",
 '''        !stopCount.matches(line) && !offerMetadata.containsMatchIn(line) && !driverLocation.containsMatchIn(line) &&''')
@@ -322,7 +322,12 @@ edit("RadarAccessibilityService.kt", '                    tariff = original.tari
 '''                    tariff = if (original.assumedEv && !candidate.assumedEv && candidate.tariff != null)
                         candidate.tariff else original.tariff ?: candidate.tariff,
                     hiddenStops = original.hiddenStops || candidate.hiddenStops,
-                    assumedEv = original.assumedEv && (candidate.tariff == null || candidate.assumedEv),''')
+                    assumedEv = if (original.tariff == null) candidate.assumedEv else
+                        original.assumedEv && (candidate.tariff == null || candidate.assumedEv),''')
+edit("RadarAccessibilityService.kt", 'if(original.tariff!=null && original.tariff!=merged.tariff)return@post',
+     'if(original.tariff!=null && !original.assumedEv && original.tariff!=merged.tariff)return@post')
+edit("RadarAccessibilityService.kt", 'if(detected.order && detected.tariff!=null && detected.tariff!=merged.tariff)return@post',
+     'if(detected.order && detected.tariff!=null && !detected.assumedEv && detected.tariff!=merged.tariff)return@post')
 # Regression tests from the two field screenshots (literal text, no fabricated route).
 p=Path("core-tests/OfferDemandCheck.kt")
 s=p.read_text()
