@@ -13,7 +13,7 @@ edit("OfflineAlmatyIndex.kt", "    private fun findExact(raw: String): BRouterCo
 edit("OfflineAlmatyIndex.kt", "    private fun findTolerant(raw: String): BRouterConnector.Point? {",
      "    internal fun findTolerant(raw: String): BRouterConnector.Point? {")
 # A query hitting the SQL cap may hide a second, conflicting location.
-edit("OfflineAlmatyIndex.kt", "            if (found.isEmpty()) return null", "            if (found.isEmpty()) return null")
+edit("OfflineAlmatyIndex.kt", "                while (cursor.moveToNext()) {\n                    if (AddressMatcher.matchesLabel(order, cursor.getString(2)) != null) {", "                if (cursor.count >= 600) return null\n                while (cursor.moveToNext()) {\n                    if (AddressMatcher.matchesLabel(order, cursor.getString(2)) != null) {")
 # Preserve all strong matches, not first arbitrary POI. Narrow the cluster to ~100m.
 edit("OfflineAlmatyIndex.kt", "kotlin.math.abs(it.lat - first.lat) > 0.003 || kotlin.math.abs(it.lon - first.lon) > 0.004",
      "kotlin.math.abs(it.lat - first.lat) > 0.0009 || kotlin.math.abs(it.lon - first.lon) > 0.0012")
@@ -52,9 +52,7 @@ edit("OfflineRoutePipeline.kt", '''                val exact = if (named) PlaceL
                 }
             }.firstOrNull { it != null }''', '''                val local = matches.filter { it.lat in 42.5..44.5 && it.lon in 75.0..79.0 }
                 val exact = if (named) PlaceLookup.namedMatch(queries.last(), local) else
-                    PlaceLookup.addressMatch(raw, local.filter { c -> c.labels.any { label ->
-                        OrderTextParser.samePoint(raw, label.split(',').take(2).joinToString(",").trim())
-                    } })
+                    PlaceLookup.verifiedAddress(raw, local)
                 val candidate = if (named) null else PlaceLookup.hybridFallback(raw, local)
                 if (candidate != null) {
                     val point = BRouterConnector.Point(candidate.lat, candidate.lon)
@@ -76,7 +74,21 @@ edit("OfflineRoutePipeline.kt", '''        if (!found.exact) throw UncertainAddr
 # Existing observeEndpoint stores unverified GPS evidence, which v50 already
 # prevents from becoming a verified routing location.
 
-edit("PlaceLookup.kt", "    private fun normalize(text: String): String =", '''    /** Plausible fallback from the old geocoder, never a verified point. */
+edit("PlaceLookup.kt", "    private fun normalize(text: String): String =", '''    /** Full parsed address match; tolerate case and spelling variants, never a different house. */
+    fun verifiedAddress(raw: String, matches: List<Match>): Match? {
+        val order = AddressMatcher.parse(raw)
+        val hits = matches.filter { c -> c.labels.any { label ->
+            if (order != null) AddressMatcher.matchesLabel(order, label) == AddressMatcher.Level.FULL
+            else OrderTextParser.samePoint(raw, label.split(',').take(2).joinToString(",").trim())
+        } }
+        val first = hits.firstOrNull() ?: return null
+        return first.takeIf { hits.all {
+            kotlin.math.abs(it.lat - first.lat) <= 0.0009 &&
+                kotlin.math.abs(it.lon - first.lon) <= 0.0012
+        } }
+    }
+
+    /** Plausible fallback from the old geocoder, never a verified point. */
     fun hybridFallback(raw: String, matches: List<Match>): Match? {
         val order = AddressMatcher.parse(raw)
         val local = matches.filter { it.lat in 42.5..44.5 && it.lon in 75.0..79.0 }
@@ -106,9 +118,14 @@ edit("PlaceLookup.kt", "    private fun normalize(text: String): String =", ''' 
         val digits = AddressMatcher.houseDigits(order)
         if (digits.isEmpty()) return null
         val houseNumber = Regex("(?<![0-9])" + Regex.escape(digits) + "(?![0-9])")
-        return cluster(local.filter { c -> c.labels.any { label ->
+        val candidate = cluster(local.filter { c -> c.labels.any { label ->
             label.lowercase(java.util.Locale.ROOT).contains(stem) && houseNumber.containsMatchIn(label)
-        } })
+        } }) ?: return null
+        // An unstructured answer cannot disambiguate a distant alternative.
+        return candidate.takeIf { local.all {
+            kotlin.math.abs(it.lat - candidate.lat) <= 0.0009 &&
+                kotlin.math.abs(it.lon - candidate.lon) <= 0.0012
+        } }
     }
 
     private fun normalize(text: String): String =''')
@@ -187,5 +204,13 @@ p.write_text(s.replace(a,'''    val weak=OfflineRoute(4.0,12.0,approximate=true,
     check(PlaceLookup.hybridFallback(requested,listOf(PlaceLookup.Match(43.25,76.95,listOf("Алматы"))))==null)
     check(PlaceLookup.hybridFallback(requested,listOf(wrong))==null)
     check(PlaceLookup.hybridFallback(requested,listOf(unknown,far))==null)
+    check(PlaceLookup.verifiedAddress("улица Байтурсынова, 103",listOf(
+        PlaceLookup.Match(43.25,76.95,listOf("улица Ахмета Байтурсынова, 103")))) != null)
+    check(PlaceLookup.verifiedAddress("Жетысуская улица, 17/1",listOf(
+        PlaceLookup.Match(43.25,76.95,listOf("Жетысуская улица, 17")))) == null)
+    check(PlaceLookup.verifiedAddress(requested,listOf(wrong)) == null)
+    check(PlaceLookup.verifiedAddress(requested,listOf(
+        PlaceLookup.Match(43.25,76.95,listOf("улица Пушкина, 83")),
+        PlaceLookup.Match(43.28,76.95,listOf("улица Пушкина, 83")))) == null)
     addressMatcherChecks()'''))
 print("v52 hybrid geocode: separate provisional road forecast, no training, overlay +20%.")
