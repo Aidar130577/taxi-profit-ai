@@ -2,9 +2,9 @@ name: Build Taxi Profit AI Android APK
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, fix/v43-stability, fix/v44-hyperos-recovery, fix/v45-route-diagnostics, fix/v47-road-only]
+    branches: [main, fix/v43-stability, fix/v44-hyperos-recovery, fix/v45-route-diagnostics, fix/v47-road-only, fix/v50-exact-geocode]
   push:
-    branches: [main, fix/v43-stability, fix/v44-hyperos-recovery, fix/v45-route-diagnostics, test/v46-road-apk, fix/v47-road-only, fix/v50-exact-geocode]
+    branches: [main, fix/v43-stability, fix/v44-hyperos-recovery, fix/v45-route-diagnostics, test/v46-road-apk, fix/v47-road-only, fix/v50-exact-geocode, fix/v52-hybrid-geocode]
     paths:
       - 'Taxi_Profit_AI_v0.17_source.zip'
       - '.github/workflows/build-apk.yml'
@@ -19,7 +19,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Prepare project
@@ -133,6 +133,8 @@ jobs:
           python3 ../patches/eta_training_export_v48.py
           python3 ../patches/tomtom_pilot_v49.py
           python3 ../patches/exact_geocode_v50.py
+          python3 ../patches/hybrid_geocode_v52.py
+          python3 ../patches/smart_geocode_v55.py
           mkdir -p app/src/main/assets/tessdata
           for lang in rus kaz eng; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/$lang.traineddata" -o "app/src/main/assets/tessdata/$lang.traineddata"
@@ -157,7 +159,7 @@ jobs:
           assert 'minSdk = 26' in s
           assert 'applicationId = "kz.taxiprofitai"' in s
           s = s.replace('applicationId = "kz.taxiprofitai"', 'applicationId = "kz.taxiprofitai.roadonly"')
-          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 50').replace('0.17.0-approved-overlays', '0.50.0-exact-geocode'))
+          g.write_text(s.replace('minSdk = 26', 'minSdk = 29').replace('versionCode = 17', 'versionCode = 55').replace('0.17.0-approved-overlays', '0.55.0-smart-geocode'))
           PY
       - uses: actions/setup-java@v4
         with:
@@ -202,6 +204,42 @@ jobs:
             'https://download.geofabrik.de/asia/kazakhstan-latest.osm.pbf' -o "$RUNNER_TEMP/kazakhstan.osm.pbf"
           PYTHONPATH="$RUNNER_TEMP/osm-python" python3 patches/build_almaty_index.py \
             "$RUNNER_TEMP/kazakhstan.osm.pbf" android-project/app/src/main/assets/almaty-osm.sqlite
+      - name: Download and validate additional Almaty catalogs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/almaty-catalogs" catalog-report
+          python3 -m venv "$RUNNER_TEMP/overture"
+          "$RUNNER_TEMP/overture/bin/pip" install 'overturemaps==2.1.1'
+          cli="$RUNNER_TEMP/overture/bin/overturemaps"
+          "$cli" download --help
+          bbox=76.70,43.12,77.17,43.45
+          for theme in place address building segment; do
+            (
+              if timeout 360 "$cli" download --bbox="$bbox" -f geojsonseq --type="$theme" -o "$RUNNER_TEMP/almaty-catalogs/$theme.geojsonseq"; then
+                echo "$theme: downloaded" > "catalog-report/$theme.status"
+              else
+                rm -f "$RUNNER_TEMP/almaty-catalogs/$theme.geojsonseq"
+                echo "$theme: unavailable" > "catalog-report/$theme.status"
+              fi
+            ) &
+          done
+          wait
+          cat catalog-report/*.status
+          curl --fail --location --retry 2 --max-time 60 'https://docs.overturemaps.org/attribution/' -o catalog-report/overture-attribution.html
+          curl --fail --location --retry 2 --max-time 60 'https://cdla.dev/permissive-2-0/' -o catalog-report/CDLA-Permissive-2.0.html
+          curl --fail --location --retry 2 --max-time 60 'https://www.apache.org/licenses/LICENSE-2.0.txt' -o catalog-report/Apache-2.0.txt
+          PYTHONPATH="$RUNNER_TEMP/osm-python" python3 patches/enrich_almaty_catalog.py \
+            android-project/app/src/main/assets/almaty-osm.sqlite "$RUNNER_TEMP/almaty-catalogs" catalog-report/overture-almaty.sqlite | tee catalog-report/import.log
+          cp catalog-report/overture-attribution.html catalog-report/CDLA-Permissive-2.0.html catalog-report/Apache-2.0.txt android-project/app/src/main/assets/
+          PYTHONPATH="$RUNNER_TEMP/osm-python" python3 patches/build_smart_index_v55.py android-project/app/src/main/assets/almaty-osm.sqlite | tee catalog-report/smart-index.log
+          cp android-project/app/src/main/assets/almaty-osm.sqlite catalog-report/almaty-osm-enriched.sqlite
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Almaty-expanded-catalogs-v55
+          path: catalog-report/
+          retention-days: 7
+          if-no-files-found: error
       - name: Prepare and test the embedded BRouter engine
         run: |
           bash patches/prepare_embedded_router.sh android-project
@@ -217,7 +255,7 @@ jobs:
         run: |
           APK=android-project/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee apk-badging.txt
-          grep -q "versionCode='50'" apk-badging.txt
+          grep -q "versionCode='55'" apk-badging.txt
           grep -q "package: name='kz.taxiprofitai.roadonly'" apk-badging.txt
           grep -q "^sdkVersion:'29'$" apk-badging.txt
           grep -q "application-label:'Знай цену'" apk-badging.txt
@@ -230,12 +268,12 @@ jobs:
           unzip -l "$APK" | grep "assets/tessdata/kaz.traineddata"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | tee apk-signing.txt
           echo "Separate road-test package; does not overwrite installed v44/v45; data and settings are separate." | tee upgrade-compatibility.txt
-          cp "$APK" ZnayTsenu-v50-exact-geocode.apk
+          cp "$APK" ZnayTsenu-v55-smart-geocode.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: ZnayTsenu-v50-exact-geocode-branded-apk
+          name: ZnayTsenu-v55-smart-geocode-branded-apk
           path: |
-            ZnayTsenu-v50-exact-geocode.apk
+            ZnayTsenu-v55-smart-geocode.apk
             apk-signing.txt
             upgrade-compatibility.txt
           retention-days: 7
@@ -254,7 +292,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ZnayTsenu-v50-exact-geocode-branded-apk
+          name: ZnayTsenu-v55-smart-geocode-branded-apk
       - name: Enable hardware virtualization
         run: sudo chmod 666 /dev/kvm
       - name: Test service and calculator overlay
@@ -264,4 +302,4 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v50-exact-geocode.apk kz.taxiprofitai.roadonly
+          script: bash ci/test_accessibility_connection.sh ZnayTsenu-v55-smart-geocode.apk kz.taxiprofitai.roadonly
