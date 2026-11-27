@@ -156,7 +156,17 @@ echo "Service connection, overlay and reconnect verified on API $api"
 old_pid=$(adb shell pidof "$package" | tr -d '\r')
 test -n "$old_pid"
 adb logcat -c
-adb shell run-as "$package" kill -9 "$old_pid"
+if ! adb shell run-as "$package" kill -9 "$old_pid"; then
+    # Android may have already replaced the process during service rebinding.
+    current_pid=$(adb shell pidof "$package" | tr -d '\r' || true)
+    if [[ -z "$current_pid" || "$current_pid" == "$old_pid" ]]; then
+        diagnostics
+        exit 1
+    fi
+    echo "Process changed before kill; retrying with current PID"
+    old_pid="$current_pid"
+    adb shell run-as "$package" kill -9 "$old_pid"
+fi
 wait_for_log "Accessibility service connected"
 wait_for_log "Order overlay attached"
 new_pid=$(adb shell pidof "$package" | tr -d '\r')
